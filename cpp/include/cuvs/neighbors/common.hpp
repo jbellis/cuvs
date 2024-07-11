@@ -363,6 +363,31 @@ struct vpq_dataset : public dataset<IdxT> {
   }
 };
 
+template <typename MathT, typename IdxT>
+struct vpq_dataset_coarse : public dataset<IdxT> {
+    /** Vector Quantization codebook - "coarse cluster centers". */
+    raft::device_matrix<MathT, uint32_t, raft::row_major> vq_code_book;
+    /** Compressed dataset (only VQ codes).  */
+    raft::device_matrix<uint32_t, IdxT, raft::row_major> data;
+
+    vpq_dataset_coarse(raft::device_matrix<MathT, uint32_t, raft::row_major>&& vq_code_book,
+                       raft::device_matrix<uint32_t, IdxT, raft::row_major>&& data)
+            : vq_code_book{std::move(vq_code_book)},
+              data{std::move(data)}
+    {
+    }
+
+    [[nodiscard]] auto n_rows() const noexcept -> IdxT final { return data.extent(0); }
+    [[nodiscard]] auto dim() const noexcept -> uint32_t final { return vq_code_book.extent(1); }
+    [[nodiscard]] auto is_owning() const noexcept -> bool final { return true; }
+
+    /** The number of "coarse cluster centers" */
+    [[nodiscard]] constexpr inline auto vq_n_centers() const noexcept -> uint32_t
+    {
+        return vq_code_book.extent(0);
+    }
+};
+
 namespace filtering {
 
 /* A filter that filters nothing. This is the default behavior. */
