@@ -123,37 +123,23 @@ auto transform_data(const raft::resources& res, DatasetT dataset)
 /** Fix the internal indexing type to avoid integer underflows/overflows */
 using ix_t = int64_t;
 
-template <typename MathT, typename DatasetT>
-auto train_vq(const raft::resources& res, const vpq_params& params, const DatasetT& dataset)
-  -> raft::device_matrix<MathT, uint32_t, raft::row_major>
-{
-  const ix_t n_rows       = dataset.extent(0);
-  const ix_t vq_n_centers = params.vq_n_centers;
-  const ix_t dim          = dataset.extent(1);
-  const ix_t n_rows_train = n_rows * params.vq_kmeans_trainset_fraction;
+    template <typename MathT, typename DatasetT>
+    auto train_vq(const raft::resources& res, const vpq_params& params, const DatasetT& dataset)
+    -> raft::device_matrix<MathT, uint32_t, raft::row_major>
+    {
+        const ix_t dim = dataset.extent(1);
 
-  // Subsample the dataset and transform into the required type if necessary
-  auto vq_trainset = util::subsample(res, dataset, n_rows_train);
-  auto vq_centers =
-    raft::make_device_matrix<MathT, uint32_t, raft::row_major>(res, vq_n_centers, dim);
+        // Create a single-centroid codebook filled with zeros
+        auto vq_centers = raft::make_device_matrix<MathT, uint32_t, raft::row_major>(res, 1, dim);
 
-  using kmeans_in_type = typename DatasetT::value_type;
-  cuvs::cluster::kmeans::balanced_params kmeans_params;
-  kmeans_params.n_iters = params.kmeans_n_iters;
-  kmeans_params.metric  = cuvs::distance::DistanceType::L2Expanded;
-  auto vq_centers_view =
-    raft::make_device_matrix_view<MathT, ix_t>(vq_centers.data_handle(), vq_n_centers, dim);
-  auto vq_trainset_view = raft::make_device_matrix_view<const kmeans_in_type, ix_t>(
-    vq_trainset.data_handle(), n_rows_train, dim);
-  cuvs::cluster::kmeans_balanced::fit<kmeans_in_type, MathT, ix_t>(
-    res,
-    kmeans_params,
-    vq_trainset_view,
-    vq_centers_view,
-    cuvs::spatial::knn::detail::utils::mapping<MathT>{});
+        // Fill the codebook with zeros
+        RAFT_CUDA_TRY(cudaMemsetAsync(vq_centers.data_handle(),
+                                      0,
+                                      vq_centers.size() * sizeof(MathT),
+                                      raft::resource::get_cuda_stream(res)));
 
-  return vq_centers;
-}
+        return vq_centers;
+    }
 
 template <typename LabelT, typename DatasetT, typename VqCentersT>
 auto predict_vq(const raft::resources& res, const DatasetT& dataset, const VqCentersT& vq_centers)
