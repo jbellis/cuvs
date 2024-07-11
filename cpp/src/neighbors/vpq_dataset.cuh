@@ -49,17 +49,4 @@ auto vpq_build(const raft::resources& res, const vpq_params& params, const Datas
   }
 }
 
-template <typename DatasetT, typename MathT = typename DatasetT::value_type, typename IdxT = typename DatasetT::index_type>
-auto vpq_build_coarse(const raft::resources& res, const vpq_params& params, const DatasetT& dataset)
--> vpq_dataset_coarse<MathT, IdxT>
-{
-    // VSTODO
-    if constexpr (std::is_same_v<MathT, half>) {
-        return detail::vpq_convert_math_type<half, float, IdxT>(
-                res, detail::vpq_build_coarse<DatasetT, float, IdxT>(res, params, dataset));
-    } else {
-        return detail::vpq_build_coarse<DatasetT, MathT, IdxT>(res, params, dataset);
-    }
-}
-
 }  // namespace cuvs::neighbors
