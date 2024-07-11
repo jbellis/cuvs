@@ -27,129 +27,104 @@
 
 #include "common.cuh"
 
-#include <raft/linalg/map.cuh>
-#include <raft/stats/mean.cuh>
+#include <cuda_runtime.h>
+#include <curand_kernel.h>
 
-template <typename T, typename IdxT>
-__global__ void decode_vpq_data_kernel(
+__global__ void compute_l2_similarities_kernel(
+        const float* query,
+        const float* vq_code_book,
+        const float* pq_code_book,
         const uint8_t* encoded_data,
-        const T* vq_codebook,
-        const T* pq_codebook,
-        T* decoded_data,
-        IdxT n_rows,
-        uint32_t dim,
-        uint32_t pq_dim,
-        uint32_t pq_bits,
-        uint32_t vq_n_centers)
-{
-    const IdxT row = blockIdx.x * blockDim.x + threadIdx.x;
-    if (row >= n_rows) return;
-
-    const uint32_t pq_len = dim / pq_dim;
-    const uint32_t encoded_row_len = sizeof(uint32_t) + raft::div_rounding_up_safe<uint32_t>(pq_dim * pq_bits, 8);
-    const uint8_t* row_data = encoded_data + row * encoded_row_len;
-
-    // Get VQ center index
-    uint32_t vq_index = *reinterpret_cast<const uint32_t*>(row_data);
-    row_data += sizeof(uint32_t);
-
-    for (uint32_t i = 0; i < pq_dim; i++) {
-        uint32_t pq_code = 0;
-        uint32_t bit_offset = i * pq_bits;
-        uint32_t byte_offset = bit_offset / 8;
-        uint32_t bit_shift = bit_offset % 8;
-
-        // Extract PQ code
-        for (uint32_t b = 0; b < pq_bits; b++) {
-            pq_code |= ((row_data[byte_offset] >> (bit_shift + b)) & 1) << b;
-        }
-
-        // Decode PQ
-        for (uint32_t j = 0; j < pq_len; j++) {
-            uint32_t col = i * pq_len + j;
-            decoded_data[row * dim + col] = pq_codebook[pq_code * pq_len + j];
-        }
-    }
-
-    // Add VQ center
-    for (uint32_t col = 0; col < dim; col++) {
-        decoded_data[row * dim + col] += vq_codebook[vq_index * dim + col];
-    }
-}
-
-__global__ void calculate_squared_diff(
-        const float* dataset,
-        const float* decoded_data,
-        float* squared_diff,
-        int64_t n_rows,
-        int64_t n_cols
+        const int64_t* node_ids,
+        float* similarities,
+        int64_t dim,
+        int64_t pq_dim,
+        int64_t pq_len,
+        int64_t vq_n_centers,
+        int n_nodes
 ) {
-    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < n_rows * n_cols) {
-        float diff = dataset[idx] - decoded_data[idx];
-        squared_diff[idx] = diff * diff;
-    }
-}
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n_nodes) return;
 
-__global__ void compute_mse_kernel(const float* squared_diff, float* mse, int64_t n_elements)
-{
-    extern __shared__ float shared_sum[];
+    int64_t node_idx = node_ids[idx];
+    const uint8_t* node_data = encoded_data + node_idx * (sizeof(uint32_t) + pq_dim);
+    uint32_t vq_code = *reinterpret_cast<const uint32_t*>(node_data);
+    const uint8_t* pq_codes = node_data + sizeof(uint32_t);
 
-    int64_t tid = blockIdx.x * blockDim.x + threadIdx.x;
-    int64_t stride = gridDim.x * blockDim.x;
+    float squared_distance = 0.0f;
 
-    float sum = 0.0f;
-    for (int64_t i = tid; i < n_elements; i += stride) {
-        sum += squared_diff[i];
-    }
+    for (int i = 0; i < pq_dim; ++i) {
+        uint8_t pq_code = pq_codes[i];
+        const float* vq_subvector = vq_code_book + vq_code * dim + i * pq_len;
+        const float* pq_subvector = pq_code_book + pq_code * pq_len;
+        const float* query_subvector = query + i * pq_len;
 
-    shared_sum[threadIdx.x] = sum;
-    __syncthreads();
-
-    // Perform reduction in shared memory
-    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (threadIdx.x < s) {
-            shared_sum[threadIdx.x] += shared_sum[threadIdx.x + s];
+        for (int j = 0; j < pq_len; ++j) {
+            float diff = query_subvector[j] - (vq_subvector[j] + pq_subvector[j]);
+            squared_distance += diff * diff;
         }
-        __syncthreads();
     }
 
-    // Write the result for this block to global memory
-    if (threadIdx.x == 0) {
-        atomicAdd(mse, shared_sum[0]);
-    }
+    similarities[idx] = 1 / (1 + squared_distance);
 }
 
-void compute_mse(const raft::resources& dev_resources,
-                 const float* squared_diff,
-                 float* mse,
-                 int64_t n_rows,
-                 int64_t n_cols)
+// Wrapper function for the compute kernel
+void compute_l2_similarities(
+        raft::device_resources const& dev_resources,
+        const float* query,
+        const cuvs::neighbors::vpq_dataset<float, int64_t>& vpq_data,
+        const std::vector<int64_t>& host_node_ids,
+        std::vector<float>& host_similarities)
 {
-    int64_t n_elements = n_rows * n_cols;
-    int block_size = 256;
-    int grid_size = (n_elements + block_size - 1) / block_size;
+    cudaStream_t stream = dev_resources.get_stream();
+    int n_nodes = host_node_ids.size();
 
-    auto stream = raft::resource::get_cuda_stream(dev_resources);
+    // Extract necessary fields from vpq_data
+    const float* vq_code_book = vpq_data.vq_code_book.data_handle();
+    const float* pq_code_book = vpq_data.pq_code_book.data_handle();
+    const uint8_t* encoded_data = vpq_data.data.data_handle();
+    int64_t dim = vpq_data.dim();
+    int64_t pq_dim = vpq_data.pq_dim();
+    int64_t pq_len = vpq_data.pq_len();
+    int64_t vq_n_centers = vpq_data.vq_n_centers();
 
-    // Set initial value of mse to 0
-    RAFT_CUDA_TRY(cudaMemsetAsync(mse, 0, sizeof(float), stream));
+    // Allocate device memory for node IDs and similarities
+    auto d_node_ids = raft::make_device_vector<int64_t, int64_t>(dev_resources, n_nodes);
+    auto d_similarities = raft::make_device_vector<float, int64_t>(dev_resources, n_nodes);
+
+    // Copy node IDs to device
+    raft::copy(d_node_ids.data_handle(), host_node_ids.data(), n_nodes, stream);
 
     // Launch kernel
-    compute_mse_kernel<<<grid_size, block_size, block_size * sizeof(float), stream>>>(
-            squared_diff, mse, n_elements);
+    int block_size = 256;
+    int grid_size = (n_nodes + block_size - 1) / block_size;
 
-    // Divide by total number of elements to get mean
-    float inv_n_elements = 1.0f / static_cast<float>(n_elements);
-    raft::linalg::scalarMultiply(mse, mse, inv_n_elements, 1, stream);
+    compute_l2_similarities_kernel<<<grid_size, block_size, 0, stream>>>(
+            query,
+            vq_code_book,
+            pq_code_book,
+            encoded_data,
+            d_node_ids.data_handle(),
+            d_similarities.data_handle(),
+            dim,
+            pq_dim,
+            pq_len,
+            vq_n_centers,
+            n_nodes
+    );
+
+    // Copy results back to host
+    raft::copy(host_similarities.data(), d_similarities.data_handle(), n_nodes, stream);
+
+    // Synchronize to ensure copy is complete
+    RAFT_CUDA_TRY(cudaStreamSynchronize(stream));
 }
 
-void vpq_test(raft::device_resources const &dev_resources,
+void vpq_test(raft::device_resources const& dev_resources,
               raft::device_matrix_view<const float, int64_t> dataset,
               raft::device_matrix_view<const float, int64_t> queries)
 {
     using namespace cuvs::neighbors;
-
     uint32_t PQ_BITS = 8;
     uint32_t PQ_LEN = 16;
 
@@ -164,51 +139,37 @@ void vpq_test(raft::device_resources const &dev_resources,
     // Build VPQ dataset
     auto vpq_data = cuvs::neighbors::vpq_build<decltype(dataset), float, int64_t>(dev_resources, params, dataset);
 
-    // Calculate the quantization error
+    // Prepare host vectors for random nodes and similarities
+    const int n_random_nodes = 32;
+    std::vector<int64_t> h_random_nodes(n_random_nodes);
+    std::vector<float> h_similarities(n_random_nodes);
 
-    // 1. Decode the VPQ-encoded data
-    auto decoded_data = raft::make_device_matrix<float, int64_t>(dev_resources, dataset.extent(0), dataset.extent(1));
+    // Create random number generator
+    std::random_device rd;
+    std::mt19937 gen(rd());
+    std::uniform_int_distribution<int64_t> dist(0, dataset.extent(0) - 1);
 
-    // Launch kernel to decode data
-    const int block_size = 256;
-    const int grid_size = (dataset.extent(0) + block_size - 1) / block_size;
+    // For each query
+    for (int64_t query_idx = 0; query_idx < queries.extent(0); ++query_idx) {
+        // Generate random nodes on host
+        std::generate(h_random_nodes.begin(), h_random_nodes.end(), [&]() { return dist(gen); });
 
-    decode_vpq_data_kernel<<<grid_size, block_size, 0, dev_resources.get_stream()>>>(
-            vpq_data.data.data_handle(),
-            vpq_data.vq_code_book.data_handle(),
-            vpq_data.pq_code_book.data_handle(),
-            decoded_data.data_handle(),
-            dataset.extent(0),
-            dim,
-            params.pq_dim,
-            params.pq_bits,
-            params.vq_n_centers
-    );
+        // Compute similarities
+        compute_l2_similarities(
+                dev_resources,
+                queries.data_handle() + query_idx * dim,
+                vpq_data,
+                h_random_nodes,
+                h_similarities
+        );
 
-    // Calculate squared differences
-    auto squared_diff = raft::make_device_matrix<float, int64_t>(dev_resources, dataset.extent(0), dataset.extent(1));
-
-    calculate_squared_diff<<<grid_size, block_size, 0, dev_resources.get_stream()>>>(
-            dataset.data_handle(),
-            decoded_data.data_handle(),
-            squared_diff.data_handle(),
-            dataset.extent(0),
-            dataset.extent(1)
-    );
-
-    // Compute mean of squared differences
-    auto mse = raft::make_device_scalar<float>(dev_resources, 0.0f);
-    compute_mse(dev_resources,
-                squared_diff.data_handle(),
-                mse.data_handle(),
-                dataset.extent(0),
-                dataset.extent(1));
-
-    // Copy result to host and print
-    float host_mse;
-    raft::copy(&host_mse, mse.data_handle(), 1, dev_resources.get_stream());
-    dev_resources.sync_stream();
-    std::cout << "Mean Squared Error (Quantization Error): " << host_mse << std::endl;
+        // Print results
+        std::cout << "Query " << query_idx << " similarities:" << std::endl;
+        for (int i = 0; i < n_random_nodes; ++i) {
+            std::cout << "Node " << h_random_nodes[i] << ": " << h_similarities[i] << std::endl;
+        }
+        std::cout << std::endl;
+    }
 }
 
 int main()
