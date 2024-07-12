@@ -20,22 +20,88 @@
 #include <raft/core/device_resources.hpp>
 #include <raft/random/make_blobs.cuh>
 
-#include "../../../cpp/src/neighbors/vpq_dataset.cuh" // fuck me
-#include <cuvs/neighbors/common.hpp>
-
 #include <rmm/mr/device/device_memory_resource.hpp>
 #include <rmm/mr/device/pool_memory_resource.hpp>
 
-#include "common.cuh"
+#include <cuvs/neighbors/common.hpp>
 
 #include <cuda_runtime.h>
 #include <curand_kernel.h>
 
+// based on cuvs::neighbors::vpq_dataset, but with only a single global centroid instead of a vq codebook
+template <typename MathT, typename IdxT>
+struct jpq_dataset : cuvs::neighbors::dataset<IdxT> {
+    /** Global centroid */
+    raft::device_vector<MathT, uint32_t> vq_center;
+    /** Product Quantization codebook */
+    raft::device_matrix<MathT, uint32_t, raft::row_major> pq_codebook;
+    /** Compressed dataset (indexes into codebook) */
+    raft::device_matrix<uint8_t, IdxT, raft::row_major> codepoints;
+
+    jpq_dataset(raft::device_vector<MathT, uint32_t>&& vq_center,
+                raft::device_matrix<MathT, uint32_t, raft::row_major>&& pq_codebook,
+                raft::device_matrix<uint8_t, IdxT, raft::row_major>&& codepoints)
+            : vq_center{std::move(vq_center)},
+              pq_codebook{std::move(pq_codebook)},
+              codepoints{std::move(codepoints)}
+    {
+    }
+
+    [[nodiscard]] auto n_rows() const noexcept -> IdxT final { return codepoints.extent(0); }
+    [[nodiscard]] auto dim() const noexcept -> uint32_t final { return vq_center.size(); }
+    [[nodiscard]] auto is_owning() const noexcept -> bool final { return true; }
+
+    /** Row length of the encoded data in bytes. */
+    [[nodiscard]] constexpr inline auto encoded_row_length() const noexcept -> uint32_t
+    {
+        return codepoints.extent(1);
+    }
+    /** The bit length of an encoded vector element after compression by PQ. */
+    [[nodiscard]] constexpr inline auto pq_bits() const noexcept -> uint32_t
+    {
+        /*
+        NOTE: pq_bits and the book size
+
+        Normally, we'd store `pq_bits` as a part of the index.
+        However, we know there's an invariant `pq_n_centers = 1 << pq_bits`, i.e. the codebook size is
+        the same as the number of possible code values. Hence, we don't store the pq_bits and derive it
+        from the array dimensions instead.
+         */
+        auto pq_width = pq_n_centers();
+#ifdef __cpp_lib_bitops
+        return std::countr_zero(pq_width);
+#else
+        uint32_t pq_bits = 0;
+        while (pq_width > 1) {
+            pq_bits++;
+            pq_width >>= 1;
+        }
+        return pq_bits;
+#endif
+    }
+    /** The dimensionality of an encoded vector after compression by PQ. */
+    [[nodiscard]] constexpr inline auto pq_dim() const noexcept -> uint32_t
+    {
+        return raft::div_rounding_up_unsafe(dim(), pq_len());
+    }
+    /** Dimensionality of a subspaces, i.e. the number of vector components mapped to a subspace */
+    [[nodiscard]] constexpr inline auto pq_len() const noexcept -> uint32_t
+    {
+        return pq_codebook.extent(1);
+    }
+    /** The number of vectors in a PQ codebook (`1 << pq_bits`). */
+    [[nodiscard]] constexpr inline auto pq_n_centers() const noexcept -> uint32_t
+    {
+        return pq_codebook.extent(0);
+    }
+};
+
+
 __global__ void compute_l2_similarities_kernel(
         const float* query,
-        const float* vq_code_book,
-        const float* pq_code_book,
-        const uint8_t* encoded_data,
+        const float* vq_center,
+        const float* pq_codebook,
+        const uint8_t* codepoints,
         const int32_t* node_ids,
         float* similarities,
         int64_t pq_dim,
@@ -46,18 +112,13 @@ __global__ void compute_l2_similarities_kernel(
     if (idx >= n_nodes) return;
 
     int32_t node_idx = node_ids[idx];
-    const uint8_t* node_data = encoded_data + node_idx * (1 + pq_dim);
-    uint8_t vq_code = *node_data;
-    if (vq_code != 0) {
-        printf("Bad vq code %d!\n", vq_code); // VSTODO add error code
-    }
-    const uint8_t* pq_codes = node_data + 1;
+    const uint8_t* pq_codes = codepoints + node_idx * pq_dim;
 
     float squared_distance = 0.0f;
     for (int i = 0; i < pq_dim; ++i) {
         uint8_t pq_code = pq_codes[i];
-        const float* vq_subvector = vq_code_book + i * pq_len;
-        const float* pq_subvector = pq_code_book + pq_code * pq_len;
+        const float* vq_subvector = vq_center + i * pq_len;
+        const float* pq_subvector = pq_codebook + pq_code * pq_len;
         const float* query_subvector = query + i * pq_len;
 
         for (int j = 0; j < pq_len; ++j) {
@@ -73,26 +134,15 @@ __global__ void compute_l2_similarities_kernel(
 void compute_l2_similarities(
         raft::device_resources const& dev_resources,
         const float* host_query,
-        const cuvs::neighbors::vpq_dataset<float, int64_t>& vpq_data,
+        const jpq_dataset<float, int64_t>& jpq_data,
         const int32_t* host_node_ids,
         float* host_similarities,
         int64_t n_nodes)
 {
     cudaStream_t stream = dev_resources.get_stream();
 
-    // Extract necessary fields from vpq_data
-    const float* vq_code_book = vpq_data.vq_code_book.data_handle();
-    const float* pq_code_book = vpq_data.pq_code_book.data_handle();
-    const uint8_t* encoded_data = vpq_data.data.data_handle();
-    int64_t dim = vpq_data.dim();
-    int64_t pq_dim = vpq_data.pq_dim();
-    int64_t pq_len = vpq_data.pq_len();
-    int64_t vq_n_centers = vpq_data.vq_n_centers();
-    if (vq_n_centers != 1) {
-        throw std::runtime_error("VQ centers count must be 1");
-    }
-
     // Allocate device memory for query, node IDs and similarities
+    int64_t dim = jpq_data.dim();
     auto d_query = raft::make_device_vector<float, int64_t>(dev_resources, dim);
     auto d_node_ids = raft::make_device_vector<int32_t, int64_t>(dev_resources, n_nodes);
     auto d_similarities = raft::make_device_vector<float, int64_t>(dev_resources, n_nodes);
@@ -107,13 +157,13 @@ void compute_l2_similarities(
 
     compute_l2_similarities_kernel<<<grid_size, block_size, 0, stream>>>(
             d_query.data_handle(),
-            vq_code_book,
-            pq_code_book,
-            encoded_data,
+            jpq_data.vq_center.data_handle(),
+            jpq_data.pq_codebook.data_handle(),
+            jpq_data.codepoints.data_handle(),
             d_node_ids.data_handle(),
             d_similarities.data_handle(),
-            pq_dim,
-            pq_len,
+            jpq_data.pq_dim(),
+            jpq_data.pq_len(),
             n_nodes
     );
 
@@ -144,7 +194,7 @@ float readFloatBE(std::ifstream& file) {
 }
 
 template <typename MathT, typename IdxT>
-cuvs::neighbors::vpq_dataset<MathT, IdxT> load_pq_vectors(raft::device_resources const &res, const std::string& filename)
+jpq_dataset<MathT, IdxT> load_pq_vectors(raft::device_resources const &res, const std::string& filename)
 {
     std::ifstream file(filename, std::ios::binary);
     if (!file) {
@@ -217,21 +267,19 @@ cuvs::neighbors::vpq_dataset<MathT, IdxT> load_pq_vectors(raft::device_resources
     std::cout << "Loading " << vector_count << " vectors with compressed dimension " << compressed_dimension << std::endl;
 
     // Prepare device arrays
-    uint32_t codes_rowlen = 1 + compressed_dimension;
-    auto vq_code_book = raft::make_device_matrix<MathT, uint32_t>(res, 1, total_dim);
-    auto pq_code_book = raft::make_device_matrix<MathT, uint32_t>(res, cluster_count, total_dim);
-    auto compressed_data = raft::make_device_matrix<uint8_t, IdxT>(res, vector_count, codes_rowlen);
+    auto vq_center = raft::make_device_vector<MathT, uint32_t>(res, total_dim);
+    auto pq_codebook = raft::make_device_matrix<MathT, uint32_t>(res, cluster_count, total_dim);
+    auto compressed_data = raft::make_device_matrix<uint8_t, IdxT>(res, vector_count, compressed_dimension);
 
     // Copy data to device
-    raft::copy(vq_code_book.data_handle(), global_centroid.data(), global_centroid.size(), raft::resource::get_cuda_stream(res));
-    raft::copy(pq_code_book.data_handle(), host_pq_codebook.data(), host_pq_codebook.size(), raft::resource::get_cuda_stream(res));
+    raft::copy(vq_center.data_handle(), global_centroid.data(), global_centroid.size(), raft::resource::get_cuda_stream(res));
+    raft::copy(pq_codebook.data_handle(), host_pq_codebook.data(), host_pq_codebook.size(), raft::resource::get_cuda_stream(res));
 
-    // initizalize the first label (the vq code) to 0
-    std::vector<uint8_t> host_compressed_data(vector_count * codes_rowlen, 0);
     // Read the pq code points
+    std::vector<uint8_t> host_compressed_data(vector_count * compressed_dimension);
     for (int i = 0; i < vector_count; ++i) {
         std::streamsize bytes_read = file.read(
-                reinterpret_cast<char*>(host_compressed_data.data() + i * codes_rowlen + 1),
+                reinterpret_cast<char*>(host_compressed_data.data() + i * compressed_dimension),
                 compressed_dimension
         ).gcount();
 
@@ -243,51 +291,47 @@ cuvs::neighbors::vpq_dataset<MathT, IdxT> load_pq_vectors(raft::device_resources
     raft::copy(compressed_data.data_handle(), host_compressed_data.data(), host_compressed_data.size(), raft::resource::get_cuda_stream(res));
     RAFT_CUDA_TRY(cudaStreamSynchronize(raft::resource::get_cuda_stream(res)));
 
-    // instantiate the vpq_dataset
-    auto vpq_data = cuvs::neighbors::vpq_dataset<MathT, IdxT>{std::move(vq_code_book), std::move(pq_code_book), std::move(compressed_data)};
+    // instantiate the jpq_dataset
+    auto jpq_data = jpq_dataset<MathT, IdxT>{std::move(vq_center), std::move(pq_codebook), std::move(compressed_data)};
 
     // Validate
-    if (vpq_data.n_rows() != vector_count) {
-        throw std::runtime_error("Row count mismatch: vpq_data.n_rows() = " + std::to_string(vpq_data.n_rows()) +
+    if (jpq_data.n_rows() != vector_count) {
+        throw std::runtime_error("Row count mismatch: jpq_data.n_rows() = " + std::to_string(jpq_data.n_rows()) +
                                  ", expected " + std::to_string(vector_count));
     }
-    if (vpq_data.dim() != total_dim) {
-        throw std::runtime_error("Dimension mismatch: vpq_data.dim() = " + std::to_string(vpq_data.dim()) +
+    if (jpq_data.dim() != total_dim) {
+        throw std::runtime_error("Dimension mismatch: jpq_data.dim() = " + std::to_string(jpq_data.dim()) +
                                  ", expected " + std::to_string(total_dim));
     }
-    if (vpq_data.encoded_row_length() != codes_rowlen) {
-        throw std::runtime_error("Encoded row length mismatch: vpq_data.encoded_row_length() = " + std::to_string(vpq_data.encoded_row_length()) +
-                                 ", expected " + std::to_string(codes_rowlen));
+    if (jpq_data.encoded_row_length() != compressed_dimension) {
+        throw std::runtime_error("Encoded row length mismatch: jpq_data.encoded_row_length() = " + std::to_string(jpq_data.encoded_row_length()) +
+                                 ", expected " + std::to_string(compressed_dimension));
     }
-    if (vpq_data.vq_n_centers() != 1) {
-        throw std::runtime_error("VQ centers count mismatch: vpq_data.vq_n_centers() = " + std::to_string(vpq_data.vq_n_centers()) +
-                                 ", expected 1");
-    }
-    if (vpq_data.pq_bits() != 8) {
-        throw std::runtime_error("PQ bits mismatch: vpq_data.pq_bits() = " + std::to_string(vpq_data.pq_bits()) +
+    if (jpq_data.pq_bits() != 8) {
+        throw std::runtime_error("PQ bits mismatch: jpq_data.pq_bits() = " + std::to_string(jpq_data.pq_bits()) +
                                  ", expected 8");
     }
-    if (vpq_data.pq_dim() != M) {
-        throw std::runtime_error("PQ dimension mismatch: vpq_data.pq_dim() = " + std::to_string(vpq_data.pq_dim()) +
+    if (jpq_data.pq_dim() != M) {
+        throw std::runtime_error("PQ dimension mismatch: jpq_data.pq_dim() = " + std::to_string(jpq_data.pq_dim()) +
                                  ", expected " + std::to_string(M));
     }
-    if (vpq_data.pq_len() != subspace_size) {
-        throw std::runtime_error("PQ length mismatch: vpq_data.pq_len() = " + std::to_string(vpq_data.pq_len()) +
+    if (jpq_data.pq_len() != subspace_size) {
+        throw std::runtime_error("PQ length mismatch: jpq_data.pq_len() = " + std::to_string(jpq_data.pq_len()) +
                                  ", expected " + std::to_string(subspace_size));
     }
-    if (vpq_data.pq_n_centers() != cluster_count) {
-        throw std::runtime_error("PQ centers count mismatch: vpq_data.pq_n_centers() = " + std::to_string(vpq_data.pq_n_centers()) +
+    if (jpq_data.pq_n_centers() != cluster_count) {
+        throw std::runtime_error("PQ centers count mismatch: jpq_data.pq_n_centers() = " + std::to_string(jpq_data.pq_n_centers()) +
                                  ", expected " + std::to_string(cluster_count));
     }
 
-    return vpq_data;
+    return jpq_data;
 }
 
-void vpq_test_java(raft::device_resources const &dev_resources)
+void jpq_test_java(raft::device_resources const &dev_resources)
 {
-    auto vpq_data = load_pq_vectors<float, int64_t>(dev_resources, "test.pqv");
+    auto jpq_data = load_pq_vectors<float, int64_t>(dev_resources, "test.pqv");
 
-    int dim = vpq_data.dim();
+    int dim = jpq_data.dim();
     float* zeros = new float[dim]();
     std::fill(zeros, zeros + dim, 0.0f);
     float* ones = new float[dim]();
@@ -301,89 +345,17 @@ void vpq_test_java(raft::device_resources const &dev_resources)
     float* similarities = new float[n_nodes];
 
     // compare zeros with the first 10 vectors in the dataset
-    compute_l2_similarities(dev_resources, zeros, vpq_data, node_ids, similarities, n_nodes);
+    compute_l2_similarities(dev_resources, zeros, jpq_data, node_ids, similarities, n_nodes);
     for (int i = 0; i < n_nodes; ++i) {
         std::cout << "Similarity with zero: " << similarities[i] << std::endl;
     }
 
     // compare ones with the first 10 vectors in the dataset
-    compute_l2_similarities(dev_resources, ones, vpq_data, node_ids, similarities, n_nodes);
+    compute_l2_similarities(dev_resources, ones, jpq_data, node_ids, similarities, n_nodes);
     for (int i = 0; i < n_nodes; ++i) {
         std::cout << "Similarity with ones: " << similarities[i] << std::endl;
     }
 
-    free(node_ids);
-    free(similarities);
-}
-
-void vpq_test_random(raft::device_resources const &dev_resources)
-{
-    using namespace cuvs::neighbors;
-    uint32_t PQ_BITS = 8;
-    uint32_t PQ_LEN = 16;
-
-    // Create input arrays.
-    int64_t n_samples = 10000;
-    int64_t n_dim     = 1024;
-    int64_t n_queries = 10;
-    auto dataset      = raft::make_device_matrix<float, int64_t>(dev_resources, n_samples, n_dim);
-    auto queries      = raft::make_device_matrix<float, int64_t>(dev_resources, n_queries, n_dim);
-    generate_dataset(dev_resources, dataset.view(), queries.view());
-
-    // Create vpq_params
-    vpq_params params;
-    params.vq_n_centers = 1;
-    const uint32_t dim = dataset.extent(1);
-    assert(dim % PQ_LEN == 0);
-    params.pq_dim = dim / PQ_LEN;
-    params.pq_bits = PQ_BITS;
-
-    // Build VPQ dataset
-    auto vpq_data = cuvs::neighbors::vpq_build<decltype(dataset), float, int64_t>(dev_resources, params, dataset);
-    if (vpq_data.vq_n_centers() != 1) {
-        throw std::runtime_error("VQ centers count mismatch: vpq_data.vq_n_centers() = " + std::to_string(vpq_data.vq_n_centers()) +
-                                 ", expected 1");
-    }
-    if (vpq_data.pq_bits() != 8) {
-        throw std::runtime_error("PQ bits mismatch: vpq_data.pq_bits() = " + std::to_string(vpq_data.pq_bits()) +
-                                 ", expected 8");
-    }
-
-    // Prepare host memory for random nodes and similarities
-    const int n_random_nodes = 32;
-    size_t alignment = 32;
-    int32_t* node_ids = static_cast<int32_t*>(aligned_alloc(alignment, n_random_nodes * sizeof(int32_t)));
-    float* similarities = static_cast<float*>(aligned_alloc(alignment, n_random_nodes * sizeof(float)));
-
-    // Create random number generator
-    std::random_device rd;
-    std::mt19937 gen(rd());
-    std::uniform_int_distribution<int32_t> dist(0, dataset.extent(0) - 1);
-
-    auto start = std::chrono::high_resolution_clock::now();
-    // For each query
-    for (int64_t query_idx = 0; query_idx < queries.extent(0); ++query_idx) {
-        // Generate random nodes
-        for (int i = 0; i < n_random_nodes; ++i) {
-            node_ids[i] = dist(gen);
-        }
-
-        // Compute similarities
-        compute_l2_similarities(
-                dev_resources,
-                queries.data_handle() + query_idx * dim,
-                vpq_data,
-                node_ids,
-                similarities,
-                n_random_nodes
-        );
-    }
-    auto end = std::chrono::high_resolution_clock::now();
-
-    std::chrono::duration<double> duration = end - start;
-    std::cout << "Total time to evaluate all queries: " << duration.count() << " seconds" << std::endl;
-
-    // Free allocated memory
     free(node_ids);
     free(similarities);
 }
@@ -403,5 +375,5 @@ int main()
   // a pool with 2 GiB upper limit.
   // raft::resource::set_workspace_to_pool_resource(dev_resources, 2 * 1024 * 1024 * 1024ull);
 
-  vpq_test_random(dev_resources);
+  jpq_test_java(dev_resources);
 }
