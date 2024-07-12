@@ -46,6 +46,7 @@ build_example() {
   -DCUVS_NVTX=OFF \
   -DCMAKE_CUDA_ARCHITECTURES="native" \
   -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
+  -DCMAKE_BUILD_TYPE=Debug \
   ${EXTRA_CMAKE_ARGS}
   # Build
   cmake --build ${build_dir} -j${PARALLEL_LEVEL}
