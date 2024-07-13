@@ -325,37 +325,31 @@ jpq_dataset<MathT, IdxT> load_pq_vectors(raft::device_resources const &res, cons
     return jpq_data;
 }
 
-void jpq_test_java(raft::device_resources const &dev_resources)
-{
+void jpq_test_simple(raft::device_resources const &dev_resources) {
     auto jpq_data = load_pq_vectors<float, int64_t>(dev_resources, "test.pqv");
 
+    // allocate fixed query vectors
     int dim = jpq_data.dim();
-    float* zeros = new float[dim]();
-    std::fill(zeros, zeros + dim, 0.0f);
-    float* ones = new float[dim]();
-    std::fill(ones, ones + dim, 1.0f);
+    std::vector<float> zeros(dim, 0.0f);
+    std::vector<float> ones(dim, 1.0f);
 
-    int64_t n_nodes = 10;
-    int32_t* node_ids = new int32_t[n_nodes];
-    for (int32_t i = 0; i < n_nodes; ++i) {
-        node_ids[i] = i;
-    }
-    float* similarities = new float[n_nodes];
+    // allocate node IDs and similarities
+    constexpr int64_t n_nodes = 10;
+    std::vector<int32_t> node_ids(n_nodes);
+    std::iota(node_ids.begin(), node_ids.end(), 0);
+    std::vector<float> similarities(n_nodes);
 
     // compare zeros with the first 10 vectors in the dataset
-    compute_l2_similarities(dev_resources, zeros, jpq_data, node_ids, similarities, n_nodes);
+    compute_l2_similarities(dev_resources, zeros.data(), jpq_data, node_ids.data(), similarities.data(), n_nodes);
     for (int i = 0; i < n_nodes; ++i) {
         std::cout << "Similarity with zero: " << similarities[i] << std::endl;
     }
 
     // compare ones with the first 10 vectors in the dataset
-    compute_l2_similarities(dev_resources, ones, jpq_data, node_ids, similarities, n_nodes);
+    compute_l2_similarities(dev_resources, ones.data(), jpq_data, node_ids.data(), similarities.data(), n_nodes);
     for (int i = 0; i < n_nodes; ++i) {
         std::cout << "Similarity with ones: " << similarities[i] << std::endl;
     }
-
-    free(node_ids);
-    free(similarities);
 }
 
 int main()
@@ -373,5 +367,5 @@ int main()
   // a pool with 2 GiB upper limit.
   // raft::resource::set_workspace_to_pool_resource(dev_resources, 2 * 1024 * 1024 * 1024ull);
 
-  jpq_test_java(dev_resources);
+  jpq_test_simple(dev_resources);
 }
