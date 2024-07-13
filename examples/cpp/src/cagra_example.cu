@@ -173,24 +173,22 @@ void compute_l2_similarities(
 }
 
 int32_t readIntBE(std::ifstream& file) {
-    uint8_t buffer[4];
-    file.read(reinterpret_cast<char*>(buffer), 4);
-    if (file.gcount() != 4) {
+    uint32_t value;
+    file.read(reinterpret_cast<char*>(&value), sizeof(int32_t));
+    if (file.gcount() != sizeof(int32_t)) {
         throw std::runtime_error("Failed to read 4 bytes for int32");
     }
-    return (buffer[0] << 24) | (buffer[1] << 16) | (buffer[2] << 8) | buffer[3];
+    return static_cast<int32_t>(__builtin_bswap32(value));  // For GCC/Clang
 }
 
 float readFloatBE(std::ifstream& file) {
-    uint8_t buffer[4];
-    file.read(reinterpret_cast<char*>(buffer), 4);
-    if (file.gcount() != 4) {
+    uint32_t intValue;
+    file.read(reinterpret_cast<char*>(&intValue), sizeof(float));
+    if (file.gcount() != sizeof(float)) {
         throw std::runtime_error("Failed to read 4 bytes for float");
     }
-    uint32_t intValue = (buffer[0] << 24) | (buffer[1] << 16) | (buffer[2] << 8) | buffer[3];
-    float floatValue;
-    std::memcpy(&floatValue, &intValue, sizeof(float));
-    return floatValue;
+    intValue = __builtin_bswap32(intValue);  // For GCC/Clang
+    return *reinterpret_cast<float*>(&intValue);
 }
 
 template <typename MathT, typename IdxT>
