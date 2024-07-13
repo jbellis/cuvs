@@ -37,13 +37,17 @@ struct jpq_dataset : cuvs::neighbors::dataset<IdxT> {
     raft::device_matrix<MathT, uint32_t, raft::row_major> pq_codebook;
     /** Compressed dataset (indexes into codebook) */
     raft::device_matrix<uint8_t, IdxT, raft::row_major> codepoints;
+    /** Dimensionality of a subspace */
+    uint32_t pq_len;
 
     jpq_dataset(raft::device_vector<MathT, uint32_t>&& vq_center,
                 raft::device_matrix<MathT, uint32_t, raft::row_major>&& pq_codebook,
-                raft::device_matrix<uint8_t, IdxT, raft::row_major>&& codepoints)
+                raft::device_matrix<uint8_t, IdxT, raft::row_major>&& codepoints,
+                uint32_t pq_len)
             : vq_center{std::move(vq_center)},
               pq_codebook{std::move(pq_codebook)},
-              codepoints{std::move(codepoints)}
+              codepoints{std::move(codepoints)},
+              pq_len{pq_len}
     {
     }
 
@@ -82,12 +86,7 @@ struct jpq_dataset : cuvs::neighbors::dataset<IdxT> {
     /** The dimensionality of an encoded vector after compression by PQ. */
     [[nodiscard]] constexpr inline auto pq_dim() const noexcept -> uint32_t
     {
-        return raft::div_rounding_up_unsafe(dim(), pq_len());
-    }
-    /** Dimensionality of a subspaces, i.e. the number of vector components mapped to a subspace */
-    [[nodiscard]] constexpr inline auto pq_len() const noexcept -> uint32_t
-    {
-        return pq_codebook.extent(1);
+        return raft::div_rounding_up_unsafe(dim(), pq_len);
     }
     /** The number of vectors in a PQ codebook (`1 << pq_bits`). */
     [[nodiscard]] constexpr inline auto pq_n_centers() const noexcept -> uint32_t
@@ -95,7 +94,6 @@ struct jpq_dataset : cuvs::neighbors::dataset<IdxT> {
         return pq_codebook.extent(0);
     }
 };
-
 
 __global__ void compute_l2_similarities_kernel(
         const float* query,
@@ -163,7 +161,7 @@ void compute_l2_similarities(
             d_node_ids.data_handle(),
             d_similarities.data_handle(),
             jpq_data.pq_dim(),
-            jpq_data.pq_len(),
+            jpq_data.pq_len,
             n_nodes
     );
 
@@ -290,7 +288,7 @@ jpq_dataset<MathT, IdxT> load_pq_vectors(raft::device_resources const &res, cons
     RAFT_CUDA_TRY(cudaStreamSynchronize(raft::resource::get_cuda_stream(res)));
 
     // instantiate the jpq_dataset
-    auto jpq_data = jpq_dataset<MathT, IdxT>{std::move(vq_center), std::move(pq_codebook), std::move(compressed_data)};
+    auto jpq_data = jpq_dataset<MathT, IdxT>{std::move(vq_center), std::move(pq_codebook), std::move(compressed_data), static_cast<uint32_t>(subspace_size)};
 
     // Validate
     if (jpq_data.n_rows() != vector_count) {
@@ -313,8 +311,8 @@ jpq_dataset<MathT, IdxT> load_pq_vectors(raft::device_resources const &res, cons
         throw std::runtime_error("PQ dimension mismatch: jpq_data.pq_dim() = " + std::to_string(jpq_data.pq_dim()) +
                                  ", expected " + std::to_string(M));
     }
-    if (jpq_data.pq_len() != subspace_size) {
-        throw std::runtime_error("PQ length mismatch: jpq_data.pq_len() = " + std::to_string(jpq_data.pq_len()) +
+    if (jpq_data.pq_len != subspace_size) {
+        throw std::runtime_error("PQ length mismatch: jpq_data.pq_len = " + std::to_string(jpq_data.pq_len) +
                                  ", expected " + std::to_string(subspace_size));
     }
     if (jpq_data.pq_n_centers() != cluster_count) {
@@ -352,6 +350,41 @@ void jpq_test_simple(raft::device_resources const &dev_resources) {
     }
 }
 
+#include <algorithm>
+#include <random>
+#include <chrono>
+#include <iostream>
+
+void jpq_test_cohere(raft::device_resources const &dev_resources) {
+    auto jpq_data = load_pq_vectors<float, int64_t>(dev_resources, "cohere.pqv");
+    std::array<int32_t, 32> node_ids{};
+    std::array<float, 32> similarities{};
+    std::array<float, 1024> q;
+
+    std::random_device rd;
+    std::mt19937 gen(rd());
+    // Query vector elements from -1 .. 1
+    std::uniform_real_distribution<> dis(-1.0, 1.0);
+    // Node IDs from 0 .. 99999
+    std::uniform_int_distribution<> node_dis(0, 99999);
+
+    std::chrono::duration<double> elapsed = std::chrono::duration<double>::zero();
+    for (int i = 0; i < 1000; ++i) {
+        // query vector
+        std::generate(q.begin(), q.end(), [&]() { return dis(gen); });
+        auto start = std::chrono::high_resolution_clock::now();
+        for (int j = 0; j < 50; ++j) {
+            // node IDs
+            std::generate(node_ids.begin(), node_ids.end(), [&]() { return node_dis(gen); });
+            // compute similarities
+            compute_l2_similarities(dev_resources, q.data(), jpq_data, node_ids.data(), similarities.data(), node_ids.size());
+        }
+        elapsed += std::chrono::high_resolution_clock::now() - start;
+    }
+
+    std::cout << "Time elapsed: " << elapsed.count() << " seconds" << std::endl;
+}
+
 int main()
 {
   raft::device_resources dev_resources;
@@ -368,4 +401,5 @@ int main()
   // raft::resource::set_workspace_to_pool_resource(dev_resources, 2 * 1024 * 1024 * 1024ull);
 
   jpq_test_simple(dev_resources);
+  jpq_test_cohere(dev_resources);
 }
