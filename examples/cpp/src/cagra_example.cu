@@ -404,7 +404,7 @@ void jpq_test_simple(raft::device_resources const &dev_resources) {
 
 void jpq_test_cohere(raft::device_resources const &dev_resources) {
     auto jpq_data = load_pq_vectors<float, int64_t>(dev_resources, "cohere.pqv");
-    std::array<int32_t, 32> node_ids{};
+    std::array<int32_t, 32*4> node_ids{};
     std::array<float, 32> similarities{};
     std::array<float, 1024> host_q;
 
@@ -425,7 +425,7 @@ void jpq_test_cohere(raft::device_resources const &dev_resources) {
         raft::copy(d_q.data_handle(), host_q.data(), 1024, dev_resources.get_stream());
 
         auto start = std::chrono::high_resolution_clock::now();
-        for (int j = 0; j < 50; ++j) {
+        for (int j = 0; j < 13; ++j) {
             // node IDs
             std::generate(node_ids.begin(), node_ids.end(), [&]() { return node_dis(gen); });
             // compute similarities
