@@ -95,41 +95,38 @@ struct jpq_dataset : cuvs::neighbors::dataset<IdxT> {
     }
 };
 
-__global__ void compute_l2_similarities_kernel(
+__global__ void compute_l2_partial_distances_kernel(
         const float* query,
         const float* vq_center,
         const float* pq_codebook,
         const uint8_t* codepoints,
         const int32_t* node_ids,
-        float* similarities,
+        float* partial_distances,
         int64_t pq_dim,
         int64_t pq_len,
-        int n_nodes
+        int n_nodes,
+        int dim
 ) {
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
     int node_idx = blockIdx.y;
 
-    if (node_idx >= n_nodes) return;
+    if (node_idx >= n_nodes || tid >= dim) return;
 
-    __shared__ float shared_distance[256]; // Adjust size based on max threads per block
+    __shared__ float shared_distance[256]; // block size
 
     const uint8_t* pq_codes = codepoints + node_ids[node_idx] * pq_dim;
-    float local_distance = 0.0f;
 
-    for (int i = tid; i < pq_dim * pq_len; i += blockDim.x) {
-        int pq_idx = i / pq_len;
-        int subvec_idx = i % pq_len;
+    int pq_idx = tid / pq_len;
+    int subvec_idx = tid % pq_len;
 
-        uint8_t pq_code = pq_codes[pq_idx];
-        float vq_val = vq_center[i];
-        float pq_val = pq_codebook[pq_code * pq_len + subvec_idx];
-        float query_val = query[i];
+    uint8_t pq_code = pq_codes[pq_idx];
+    float vq_val = vq_center[tid];
+    float pq_val = pq_codebook[pq_code * pq_len + subvec_idx];
+    float query_val = query[tid];
 
-        float diff = query_val - (vq_val + pq_val);
-        local_distance += diff * diff;
-    }
+    float diff = query_val - (vq_val + pq_val);
+    float local_distance = diff * diff;
 
-    // Reduce within thread block
     shared_distance[threadIdx.x] = local_distance;
     __syncthreads();
 
@@ -140,13 +137,28 @@ __global__ void compute_l2_similarities_kernel(
         __syncthreads();
     }
 
-    // Write result
     if (threadIdx.x == 0) {
-        similarities[node_idx] = 1 / (1 + shared_distance[0]);
+        partial_distances[blockIdx.y * gridDim.x + blockIdx.x] = shared_distance[0];
     }
 }
 
-// Wrapper function for the compute kernel
+__global__ void reduce_and_compute_similarities_kernel(
+        const float* partial_distances,
+        float* similarities,
+        int n_nodes,
+        int blocks_per_node
+) {
+    int node_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (node_idx >= n_nodes) return;
+
+    float total_distance = 0.0f;
+    for (int i = 0; i < blocks_per_node; i++) {
+        total_distance += partial_distances[node_idx * blocks_per_node + i];
+    }
+
+    similarities[node_idx] = 1 / (1 + total_distance);
+}
+
 void compute_l2_similarities(
         raft::device_resources const& dev_resources,
         const float* host_query,
@@ -157,30 +169,42 @@ void compute_l2_similarities(
 {
     cudaStream_t stream = dev_resources.get_stream();
 
-    // Allocate device memory for query, node IDs and similarities
     int64_t dim = jpq_data.dim();
     auto d_query = raft::make_device_vector<float, int64_t>(dev_resources, dim);
     auto d_node_ids = raft::make_device_vector<int32_t, int64_t>(dev_resources, n_nodes);
-    auto d_similarities = raft::make_device_vector<float, int64_t>(dev_resources, n_nodes);
-
-    // Copy query and node IDs to device
     raft::copy(d_query.data_handle(), host_query, dim, stream);
     raft::copy(d_node_ids.data_handle(), host_node_ids, n_nodes, stream);
 
-    // Launch kernel with grid of (dimension, n_nodes) threads
     int block_size = 256;
-    dim3 grid_size((jpq_data.dim() + block_size - 1) / block_size, n_nodes);
+    int blocks_per_dim = (dim + block_size - 1) / block_size;
+    dim3 grid_size(blocks_per_dim, n_nodes);
 
-    compute_l2_similarities_kernel<<<grid_size, block_size, 0, stream>>>(
+    // Allocate memory for partial distances
+    auto d_partial_distances = raft::make_device_vector<float, int64_t>(dev_resources, blocks_per_dim * n_nodes);
+    auto d_similarities = raft::make_device_vector<float, int64_t>(dev_resources, n_nodes);
+
+    // First kernel: Compute partial distances
+    compute_l2_partial_distances_kernel<<<grid_size, block_size, 0, stream>>>(
             d_query.data_handle(),
             jpq_data.vq_center.data_handle(),
             jpq_data.pq_codebook.data_handle(),
             jpq_data.codepoints.data_handle(),
             d_node_ids.data_handle(),
-            d_similarities.data_handle(),
+            d_partial_distances.data_handle(),
             jpq_data.pq_dim(),
             jpq_data.pq_len,
-            n_nodes
+            n_nodes,
+            dim
+    );
+
+    // Second kernel: Reduce partial distances and compute similarities
+    int threads_per_block = 256;
+    int blocks = (n_nodes + threads_per_block - 1) / threads_per_block;
+    reduce_and_compute_similarities_kernel<<<blocks, threads_per_block, 0, stream>>>(
+            d_partial_distances.data_handle(),
+            d_similarities.data_handle(),
+            n_nodes,
+            blocks_per_dim
     );
 
     // Copy results back to host
