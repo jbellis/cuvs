@@ -112,30 +112,33 @@ __global__ void compute_l2_partial_distances_kernel(
         int n_nodes,
         int dim
 ) {
-    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int index = blockIdx.x * blockDim.x + threadIdx.x;
     int node_idx = blockIdx.y;
 
-    if (node_idx >= n_nodes || tid >= dim) return;
+    if (node_idx >= n_nodes || index >= dim) {
+        return;
+    }
 
     __shared__ float shared_distance[256]; // block size
 
     const uint8_t* pq_codes = codepoints + node_ids[node_idx] * pq_dim;
 
     // corresponding value at the pq center
-    int pq_idx = tid / pq_len; // which codebook center
-    int subvec_idx = tid % pq_len; // offset within the codebook center
+    int pq_idx = index / pq_len; // which codebook center
+    int subvec_idx = index % pq_len; // offset within the codebook center
     uint8_t pq_code = pq_codes[pq_idx];
     float pq_val = pq_codebook[pq_code * pq_len + subvec_idx];
 
     // combine pq, vq, and query values to compute the distance
-    float query_val = query[tid];
-    float vq_val = vq_center[tid];
+    float query_val = query[index];
+    float vq_val = vq_center[index];
     float diff = query_val - (vq_val + pq_val);
     float local_distance = diff * diff;
 
     shared_distance[threadIdx.x] = local_distance;
     __syncthreads();
 
+    // reduce within block
     for (int s = blockDim.x / 2; s > 0; s >>= 1) {
         if (threadIdx.x < s) {
             shared_distance[threadIdx.x] += shared_distance[threadIdx.x + s];
@@ -143,6 +146,7 @@ __global__ void compute_l2_partial_distances_kernel(
         __syncthreads();
     }
 
+    // write this block's partial distance to global memory
     if (threadIdx.x == 0) {
         partial_distances[blockIdx.y * gridDim.x + blockIdx.x] = shared_distance[0];
     }
@@ -159,7 +163,8 @@ __global__ void reduce_and_compute_similarities_kernel(
 
     float total_distance = 0.0f;
     for (int i = 0; i < blocks_per_node; i++) {
-        total_distance += partial_distances[node_idx * blocks_per_node + i];
+        auto block_distance = partial_distances[node_idx * blocks_per_node + i];
+        total_distance += block_distance;
     }
 
     similarities[node_idx] = 1 / (1 + total_distance);
@@ -175,19 +180,17 @@ void compute_l2_similarities(
 {
     cudaStream_t stream = dev_resources.get_stream();
 
+    // copy node ids to device
     int64_t dim = jpq_data.dim();
     auto d_node_ids = raft::make_device_vector<int32_t, int64_t>(dev_resources, n_nodes);
     raft::copy(d_node_ids.data_handle(), host_node_ids, n_nodes, stream);
 
+    // First kernel: Compute partial distances for each block of threads
+    // (we support vectors larger than 256 dimensions), for all nodes in a single grid
     int block_size = 256;
-    int blocks_per_dim = (dim + block_size - 1) / block_size;
-    dim3 grid_size(blocks_per_dim, n_nodes);
-
-    // Allocate memory for partial distances
-    auto d_partial_distances = raft::make_device_vector<float, int64_t>(dev_resources, blocks_per_dim * n_nodes);
-    auto d_similarities = raft::make_device_vector<float, int64_t>(dev_resources, n_nodes);
-
-    // First kernel: Compute partial distances
+    int blocks_per_node = (dim + block_size - 1) / block_size;
+    dim3 grid_size(blocks_per_node, n_nodes);
+    auto d_partial_distances = raft::make_device_vector<float, int64_t>(dev_resources, blocks_per_node * n_nodes);
     compute_l2_partial_distances_kernel<<<grid_size, block_size, 0, stream>>>(
             d_query.data_handle(),
             jpq_data.vq_center.data_handle(),
@@ -202,13 +205,13 @@ void compute_l2_similarities(
     );
 
     // Second kernel: Reduce partial distances and compute similarities
-    int threads_per_block = 256;
-    int blocks = (n_nodes + threads_per_block - 1) / threads_per_block;
-    reduce_and_compute_similarities_kernel<<<blocks, threads_per_block, 0, stream>>>(
+    auto d_similarities = raft::make_device_vector<float, int64_t>(dev_resources, n_nodes);
+    int reduce_blocks = (n_nodes + block_size - 1) / block_size;
+    reduce_and_compute_similarities_kernel<<<reduce_blocks, block_size, 0, stream>>>(
             d_partial_distances.data_handle(),
             d_similarities.data_handle(),
             n_nodes,
-            blocks_per_dim
+            blocks_per_node
     );
 
     // Copy results back to host
@@ -433,31 +436,31 @@ void jpq_test_cohere(raft::device_resources const &dev_resources) {
         std::cout << "Similarity with ones: " << similarities[i] << std::endl;
     }
 
-    // Benchmark random queries
-    std::random_device rd;
-    std::mt19937 gen(rd());
-    // Query vector elements from -1 .. 1
-    std::uniform_real_distribution<> dis(-1.0, 1.0);
-    // Node IDs from 0 .. 99999
-    std::uniform_int_distribution<> node_dis(0, 99999);
-
-    std::chrono::duration<double> elapsed = std::chrono::duration<double>::zero();
-    for (int i = 0; i < 1000; ++i) {
-        // query vector
-        std::generate(host_q.begin(), host_q.end(), [&]() { return dis(gen); });
-        raft::copy(d_q.data_handle(), host_q.data(), 1024, dev_resources.get_stream());
-
-        auto start = std::chrono::high_resolution_clock::now();
-        for (int j = 0; j < 50; ++j) {
-            // node IDs
-            std::generate(node_ids.begin(), node_ids.end(), [&]() { return node_dis(gen); });
-            // compute similarities
-            compute_l2_similarities(dev_resources, d_q, jpq_data, node_ids.data(), similarities.data(), node_ids.size());
-        }
-        elapsed += std::chrono::high_resolution_clock::now() - start;
-    }
-
-    std::cout << "Time elapsed: " << elapsed.count() << " seconds" << std::endl;
+//    // Benchmark random queries
+//    std::random_device rd;
+//    std::mt19937 gen(rd());
+//    // Query vector elements from -1 .. 1
+//    std::uniform_real_distribution<> dis(-1.0, 1.0);
+//    // Node IDs from 0 .. 99999
+//    std::uniform_int_distribution<> node_dis(0, 99999);
+//
+//    std::chrono::duration<double> elapsed = std::chrono::duration<double>::zero();
+//    for (int i = 0; i < 1000; ++i) {
+//        // query vector
+//        std::generate(host_q.begin(), host_q.end(), [&]() { return dis(gen); });
+//        raft::copy(d_q.data_handle(), host_q.data(), 1024, dev_resources.get_stream());
+//
+//        auto start = std::chrono::high_resolution_clock::now();
+//        for (int j = 0; j < 50; ++j) {
+//            // node IDs
+//            std::generate(node_ids.begin(), node_ids.end(), [&]() { return node_dis(gen); });
+//            // compute similarities
+//            compute_l2_similarities(dev_resources, d_q, jpq_data, node_ids.data(), similarities.data(), node_ids.size());
+//        }
+//        elapsed += std::chrono::high_resolution_clock::now() - start;
+//    }
+//
+//    std::cout << "Time elapsed: " << elapsed.count() << " seconds" << std::endl;
 }
 
 int main()
