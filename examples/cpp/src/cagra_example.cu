@@ -185,6 +185,7 @@ void compute_l2_similarities(
     int64_t dim = jpq_data.dim();
     auto d_node_ids = raft::make_device_vector<int32_t, int64_t>(res, n_nodes);
     raft::copy(d_node_ids.data_handle(), host_node_ids, n_nodes, stream);
+    res.sync_stream();
 
     // First kernel: Compute partial distances for each block of threads
     // (we support vectors larger than 256 dimensions), for all nodes in a single grid
@@ -195,7 +196,7 @@ void compute_l2_similarities(
     compute_l2_partial_distances_kernel<<<grid_size, block_size, 0, stream>>>(
             d_query.data_handle(),
             jpq_data.vq_center.data_handle(),
-            jpq_data.pq_codebook.data_handle(),
+            jpq_data.pq_codebook.data_handle() + 1,
             jpq_data.codepoints.data_handle(),
             d_node_ids.data_handle(),
             d_partial_distances.data_handle(),
@@ -217,7 +218,7 @@ void compute_l2_similarities(
 
     // Copy results back to host
     raft::copy(host_similarities, d_similarities.data_handle(), n_nodes, stream);
-    RAFT_CUDA_TRY(cudaStreamSynchronize(stream));
+    res.sync_stream();
 }
 
 int32_t readIntBE(std::ifstream& file) {
@@ -335,7 +336,7 @@ jpq_dataset<MathT, IdxT> load_pq_vectors(raft::device_resources const &res, cons
     }
     // copy to device memory
     raft::copy(compressed_data.data_handle(), host_compressed_data.data(), host_compressed_data.size(), raft::resource::get_cuda_stream(res));
-    RAFT_CUDA_TRY(cudaStreamSynchronize(raft::resource::get_cuda_stream(res)));
+    res.sync_stream();
 
     // instantiate the jpq_dataset
     auto jpq_data = jpq_dataset<MathT, IdxT>{std::move(vq_center), std::move(pq_codebook), std::move(compressed_data), static_cast<uint32_t>(subspace_size)};
@@ -386,6 +387,7 @@ void jpq_test_simple(raft::device_resources const &res) {
     auto d_ones = raft::make_device_vector<float, int64_t>(res, dim);
     raft::copy(d_zeros.data_handle(), host_zeros.data(), dim, res.get_stream());
     raft::copy(d_ones.data_handle(), host_ones.data(), dim, res.get_stream());
+    res.sync_stream();
 
     // allocate node IDs and similarities
     constexpr int64_t n_nodes = 10;
@@ -423,6 +425,7 @@ void jpq_test_cohere(raft::device_resources const &res) {
     auto d_ones = raft::make_device_vector<float, int64_t>(res, dim);
     raft::copy(d_zeros.data_handle(), host_zeros.data(), dim, res.get_stream());
     raft::copy(d_ones.data_handle(), host_ones.data(), dim, res.get_stream());
+    res.sync_stream();
 
     // compare zeros with the first 10 vectors in the dataset
     std::iota(node_ids.begin(), node_ids.end(), 0);
@@ -451,6 +454,7 @@ void jpq_test_cohere(raft::device_resources const &res) {
         // query vector
         std::generate(host_q.begin(), host_q.end(), [&]() { return dis(gen); });
         raft::copy(d_q.data_handle(), host_q.data(), 1024, res.get_stream());
+        res.sync_stream();
 
         auto start = std::chrono::high_resolution_clock::now();
         for (int j = 0; j < 50; ++j) {
