@@ -14,6 +14,11 @@
  * limitations under the License.
  */
 
+#include <algorithm>
+#include <random>
+#include <chrono>
+#include <iostream>
+
 #include <chrono>
 #include <cstdint>
 #include <raft/core/device_mdarray.hpp>
@@ -162,7 +167,7 @@ __global__ void reduce_and_compute_similarities_kernel(
 
 void compute_l2_similarities(
         raft::device_resources const& dev_resources,
-        const float* host_query,
+        const raft::device_vector<float, int64_t>& d_query,
         const jpq_dataset<float, int64_t>& jpq_data,
         const int32_t* host_node_ids,
         float* host_similarities,
@@ -171,9 +176,7 @@ void compute_l2_similarities(
     cudaStream_t stream = dev_resources.get_stream();
 
     int64_t dim = jpq_data.dim();
-    auto d_query = raft::make_device_vector<float, int64_t>(dev_resources, dim);
     auto d_node_ids = raft::make_device_vector<int32_t, int64_t>(dev_resources, n_nodes);
-    raft::copy(d_query.data_handle(), host_query, dim, stream);
     raft::copy(d_node_ids.data_handle(), host_node_ids, n_nodes, stream);
 
     int block_size = 256;
@@ -371,8 +374,14 @@ void jpq_test_simple(raft::device_resources const &dev_resources) {
 
     // allocate fixed query vectors
     int dim = jpq_data.dim();
-    std::vector<float> zeros(dim, 0.0f);
-    std::vector<float> ones(dim, 1.0f);
+    std::vector<float> host_zeros(dim, 0.0f);
+    std::vector<float> host_ones(dim, 1.0f);
+
+    // Create device vectors for queries
+    auto d_zeros = raft::make_device_vector<float, int64_t>(dev_resources, dim);
+    auto d_ones = raft::make_device_vector<float, int64_t>(dev_resources, dim);
+    raft::copy(d_zeros.data_handle(), host_zeros.data(), dim, dev_resources.get_stream());
+    raft::copy(d_ones.data_handle(), host_ones.data(), dim, dev_resources.get_stream());
 
     // allocate node IDs and similarities
     constexpr int64_t n_nodes = 10;
@@ -381,28 +390,26 @@ void jpq_test_simple(raft::device_resources const &dev_resources) {
     std::vector<float> similarities(n_nodes);
 
     // compare zeros with the first 10 vectors in the dataset
-    compute_l2_similarities(dev_resources, zeros.data(), jpq_data, node_ids.data(), similarities.data(), n_nodes);
+    compute_l2_similarities(dev_resources, d_zeros, jpq_data, node_ids.data(), similarities.data(), n_nodes);
     for (int i = 0; i < n_nodes; ++i) {
         std::cout << "Similarity with zero: " << similarities[i] << std::endl;
     }
 
     // compare ones with the first 10 vectors in the dataset
-    compute_l2_similarities(dev_resources, ones.data(), jpq_data, node_ids.data(), similarities.data(), n_nodes);
+    compute_l2_similarities(dev_resources, d_ones, jpq_data, node_ids.data(), similarities.data(), n_nodes);
     for (int i = 0; i < n_nodes; ++i) {
         std::cout << "Similarity with ones: " << similarities[i] << std::endl;
     }
 }
 
-#include <algorithm>
-#include <random>
-#include <chrono>
-#include <iostream>
-
 void jpq_test_cohere(raft::device_resources const &dev_resources) {
     auto jpq_data = load_pq_vectors<float, int64_t>(dev_resources, "cohere.pqv");
     std::array<int32_t, 32> node_ids{};
     std::array<float, 32> similarities{};
-    std::array<float, 1024> q;
+    std::array<float, 1024> host_q;
+
+    // Create device vector for query
+    auto d_q = raft::make_device_vector<float, int64_t>(dev_resources, 1024);
 
     std::random_device rd;
     std::mt19937 gen(rd());
@@ -414,13 +421,15 @@ void jpq_test_cohere(raft::device_resources const &dev_resources) {
     std::chrono::duration<double> elapsed = std::chrono::duration<double>::zero();
     for (int i = 0; i < 1000; ++i) {
         // query vector
-        std::generate(q.begin(), q.end(), [&]() { return dis(gen); });
+        std::generate(host_q.begin(), host_q.end(), [&]() { return dis(gen); });
+        raft::copy(d_q.data_handle(), host_q.data(), 1024, dev_resources.get_stream());
+
         auto start = std::chrono::high_resolution_clock::now();
         for (int j = 0; j < 50; ++j) {
             // node IDs
             std::generate(node_ids.begin(), node_ids.end(), [&]() { return node_dis(gen); });
             // compute similarities
-            compute_l2_similarities(dev_resources, q.data(), jpq_data, node_ids.data(), similarities.data(), node_ids.size());
+            compute_l2_similarities(dev_resources, d_q, jpq_data, node_ids.data(), similarities.data(), node_ids.size());
         }
         elapsed += std::chrono::high_resolution_clock::now() - start;
     }
