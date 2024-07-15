@@ -95,12 +95,6 @@ struct jpq_dataset : cuvs::neighbors::dataset<IdxT> {
     }
 };
 
-__device__ float warp_reduce_sum(float val) {
-    for (int offset = 16; offset > 0; offset /= 2)
-        val += __shfl_down_sync(0xffffffff, val, offset);
-    return val;
-}
-
 __global__ void compute_l2_similarities_kernel(
         const float* query,
         const float* vq_center,
@@ -117,7 +111,7 @@ __global__ void compute_l2_similarities_kernel(
 
     if (node_idx >= n_nodes) return;
 
-    __shared__ float warp_results[32]; // Assumes max 1024 threads per block
+    __shared__ float shared_distance[256]; // Adjust size based on max threads per block
 
     const uint8_t* pq_codes = codepoints + node_ids[node_idx] * pq_dim;
     float local_distance = 0.0f;
@@ -135,28 +129,20 @@ __global__ void compute_l2_similarities_kernel(
         local_distance += diff * diff;
     }
 
-    // Warp-level reduction
-    int warp_id = threadIdx.x / 32;
-    float warp_sum = warp_reduce_sum(local_distance);
-
-    // Write warp result to shared memory
-    if (threadIdx.x % 32 == 0) {
-        warp_results[warp_id] = warp_sum;
-    }
-
+    // Reduce within thread block
+    shared_distance[threadIdx.x] = local_distance;
     __syncthreads();
 
-    // Final reduction (only one warp needed)
-    if (warp_id == 0) {
-        float final_sum = 0.0f;
-        if (threadIdx.x < (blockDim.x + 31) / 32) { // number of warps
-            final_sum = warp_results[threadIdx.x];
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) {
+            shared_distance[threadIdx.x] += shared_distance[threadIdx.x + s];
         }
-        final_sum = warp_reduce_sum(final_sum);
+        __syncthreads();
+    }
 
-        if (threadIdx.x == 0) {
-            similarities[node_idx] = 1 / (1 + final_sum);
-        }
+    // Write result
+    if (threadIdx.x == 0) {
+        similarities[node_idx] = 1 / (1 + shared_distance[0]);
     }
 }
 
