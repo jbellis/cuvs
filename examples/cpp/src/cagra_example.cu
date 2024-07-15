@@ -106,26 +106,44 @@ __global__ void compute_l2_similarities_kernel(
         int64_t pq_len,
         int n_nodes
 ) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= n_nodes) return;
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int node_idx = blockIdx.y;
 
-    int32_t node_idx = node_ids[idx];
-    const uint8_t* pq_codes = codepoints + node_idx * pq_dim;
+    if (node_idx >= n_nodes) return;
 
-    float squared_distance = 0.0f;
-    for (int i = 0; i < pq_dim; ++i) {
-        uint8_t pq_code = pq_codes[i];
-        const float* vq_subvector = vq_center + i * pq_len;
-        const float* pq_subvector = pq_codebook + pq_code * pq_len;
-        const float* query_subvector = query + i * pq_len;
+    __shared__ float shared_distance[256]; // Adjust size based on max threads per block
 
-        for (int j = 0; j < pq_len; ++j) {
-            float diff = query_subvector[j] - (vq_subvector[j] + pq_subvector[j]);
-            squared_distance += diff * diff;
-        }
+    const uint8_t* pq_codes = codepoints + node_ids[node_idx] * pq_dim;
+    float local_distance = 0.0f;
+
+    for (int i = tid; i < pq_dim * pq_len; i += blockDim.x) {
+        int pq_idx = i / pq_len;
+        int subvec_idx = i % pq_len;
+
+        uint8_t pq_code = pq_codes[pq_idx];
+        float vq_val = vq_center[i];
+        float pq_val = pq_codebook[pq_code * pq_len + subvec_idx];
+        float query_val = query[i];
+
+        float diff = query_val - (vq_val + pq_val);
+        local_distance += diff * diff;
     }
 
-    similarities[idx] = 1 / (1 + squared_distance);
+    // Reduce within thread block
+    shared_distance[threadIdx.x] = local_distance;
+    __syncthreads();
+
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) {
+            shared_distance[threadIdx.x] += shared_distance[threadIdx.x + s];
+        }
+        __syncthreads();
+    }
+
+    // Write result
+    if (threadIdx.x == 0) {
+        similarities[node_idx] = 1 / (1 + shared_distance[0]);
+    }
 }
 
 // Wrapper function for the compute kernel
@@ -149,9 +167,9 @@ void compute_l2_similarities(
     raft::copy(d_query.data_handle(), host_query, dim, stream);
     raft::copy(d_node_ids.data_handle(), host_node_ids, n_nodes, stream);
 
-    // Launch kernel
+    // Launch kernel with grid of (dimension, n_nodes) threads
     int block_size = 256;
-    int grid_size = (n_nodes + block_size - 1) / block_size;
+    dim3 grid_size((jpq_data.dim() + block_size - 1) / block_size, n_nodes);
 
     compute_l2_similarities_kernel<<<grid_size, block_size, 0, stream>>>(
             d_query.data_handle(),
