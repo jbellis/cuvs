@@ -107,27 +107,29 @@ __global__ void compute_l2_partial_distances_kernel(
         const uint8_t* codepoints,
         const int32_t* node_ids,
         float* partial_distances,
-        int64_t pq_dim,
-        int64_t pq_len,
+        int64_t pq_dim, // how many subspaces
+        int64_t pq_len, // how many dimensions per subspace centroid
         int n_nodes,
         int dim
 ) {
     int index = blockIdx.x * blockDim.x + threadIdx.x;
     int node_idx = blockIdx.y;
 
+    __shared__ float shared_distance[256]; // block size
     if (node_idx >= n_nodes || index >= dim) {
+        shared_distance[threadIdx.x] = 0.0f;
         return;
     }
 
-    __shared__ float shared_distance[256]; // block size
-
+    // the PQ codes (indexes of the subspace centroids) for this node
     const uint8_t* pq_codes = codepoints + node_ids[node_idx] * pq_dim;
+    int subspace_idx = index / pq_len; // which codebook subspace
+    const float* subspace_centroids = pq_codebook + subspace_idx * (pq_len * 256); // 256 = pq_n_centers
 
-    // corresponding value at the pq center
-    int pq_idx = index / pq_len; // which codebook center
+    // find the value corresponding to `index` in the pq centroid
     int subvec_idx = index % pq_len; // offset within the codebook center
-    uint8_t pq_code = pq_codes[pq_idx];
-    float pq_val = pq_codebook[pq_code * pq_len + subvec_idx];
+    uint8_t pq_code = pq_codes[subspace_idx];
+    float pq_val = subspace_centroids[pq_code * pq_len + subvec_idx];
 
     // combine pq, vq, and query values to compute the distance
     float query_val = query[index];
@@ -148,7 +150,7 @@ __global__ void compute_l2_partial_distances_kernel(
 
     // write this block's partial distance to global memory
     if (threadIdx.x == 0) {
-        partial_distances[blockIdx.y * gridDim.x + blockIdx.x] = shared_distance[0];
+        partial_distances[node_idx * gridDim.x + blockIdx.x] = shared_distance[0];
     }
 }
 
@@ -163,8 +165,7 @@ __global__ void reduce_and_compute_similarities_kernel(
 
     float total_distance = 0.0f;
     for (int i = 0; i < blocks_per_node; i++) {
-        auto block_distance = partial_distances[node_idx * blocks_per_node + i];
-        total_distance += block_distance;
+        total_distance += partial_distances[node_idx * blocks_per_node + i];
     }
 
     similarities[node_idx] = 1 / (1 + total_distance);
@@ -424,6 +425,7 @@ void jpq_test_cohere(raft::device_resources const &dev_resources) {
     raft::copy(d_ones.data_handle(), host_ones.data(), dim, dev_resources.get_stream());
 
     // compare zeros with the first 10 vectors in the dataset
+    std::iota(node_ids.begin(), node_ids.end(), 0);
     constexpr int64_t n_nodes = 10;
     compute_l2_similarities(dev_resources, d_zeros, jpq_data, node_ids.data(), similarities.data(), n_nodes);
     for (int i = 0; i < n_nodes; ++i) {
@@ -436,31 +438,31 @@ void jpq_test_cohere(raft::device_resources const &dev_resources) {
         std::cout << "Similarity with ones: " << similarities[i] << std::endl;
     }
 
-//    // Benchmark random queries
-//    std::random_device rd;
-//    std::mt19937 gen(rd());
-//    // Query vector elements from -1 .. 1
-//    std::uniform_real_distribution<> dis(-1.0, 1.0);
-//    // Node IDs from 0 .. 99999
-//    std::uniform_int_distribution<> node_dis(0, 99999);
-//
-//    std::chrono::duration<double> elapsed = std::chrono::duration<double>::zero();
-//    for (int i = 0; i < 1000; ++i) {
-//        // query vector
-//        std::generate(host_q.begin(), host_q.end(), [&]() { return dis(gen); });
-//        raft::copy(d_q.data_handle(), host_q.data(), 1024, dev_resources.get_stream());
-//
-//        auto start = std::chrono::high_resolution_clock::now();
-//        for (int j = 0; j < 50; ++j) {
-//            // node IDs
-//            std::generate(node_ids.begin(), node_ids.end(), [&]() { return node_dis(gen); });
-//            // compute similarities
-//            compute_l2_similarities(dev_resources, d_q, jpq_data, node_ids.data(), similarities.data(), node_ids.size());
-//        }
-//        elapsed += std::chrono::high_resolution_clock::now() - start;
-//    }
-//
-//    std::cout << "Time elapsed: " << elapsed.count() << " seconds" << std::endl;
+    // Benchmark random queries
+    std::random_device rd;
+    std::mt19937 gen(rd());
+    // Query vector elements from -1 .. 1
+    std::uniform_real_distribution<> dis(-1.0, 1.0);
+    // Node IDs from 0 .. 99999
+    std::uniform_int_distribution<> node_dis(0, 99999);
+
+    std::chrono::duration<double> elapsed = std::chrono::duration<double>::zero();
+    for (int i = 0; i < 1000; ++i) {
+        // query vector
+        std::generate(host_q.begin(), host_q.end(), [&]() { return dis(gen); });
+        raft::copy(d_q.data_handle(), host_q.data(), 1024, dev_resources.get_stream());
+
+        auto start = std::chrono::high_resolution_clock::now();
+        for (int j = 0; j < 50; ++j) {
+            // node IDs
+            std::generate(node_ids.begin(), node_ids.end(), [&]() { return node_dis(gen); });
+            // compute similarities
+            compute_l2_similarities(dev_resources, d_q, jpq_data, node_ids.data(), similarities.data(), node_ids.size());
+        }
+        elapsed += std::chrono::high_resolution_clock::now() - start;
+    }
+
+    std::cout << "Time elapsed: " << elapsed.count() << " seconds" << std::endl;
 }
 
 int main()
