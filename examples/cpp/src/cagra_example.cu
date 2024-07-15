@@ -484,6 +484,5 @@ int main()
   // a pool with 2 GiB upper limit.
   // raft::resource::set_workspace_to_pool_resource(res, 2 * 1024 * 1024 * 1024ull);
 
-  jpq_test_simple(res);
   jpq_test_cohere(res);
 }
