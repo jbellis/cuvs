@@ -116,14 +116,15 @@ __global__ void compute_l2_partial_distances_kernel(
 
     const uint8_t* pq_codes = codepoints + node_ids[node_idx] * pq_dim;
 
-    int pq_idx = tid / pq_len;
-    int subvec_idx = tid % pq_len;
-
+    // corresponding value at the pq center
+    int pq_idx = tid / pq_len; // which codebook center
+    int subvec_idx = tid % pq_len; // offset within the codebook center
     uint8_t pq_code = pq_codes[pq_idx];
-    float vq_val = vq_center[tid];
     float pq_val = pq_codebook[pq_code * pq_len + subvec_idx];
-    float query_val = query[tid];
 
+    // combine pq, vq, and query values to compute the distance
+    float query_val = query[tid];
+    float vq_val = vq_center[tid];
     float diff = query_val - (vq_val + pq_val);
     float local_distance = diff * diff;
 
