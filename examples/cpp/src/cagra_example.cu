@@ -407,10 +407,33 @@ void jpq_test_cohere(raft::device_resources const &dev_resources) {
     std::array<int32_t, 32> node_ids{};
     std::array<float, 32> similarities{};
     std::array<float, 1024> host_q;
-
-    // Create device vector for query
     auto d_q = raft::make_device_vector<float, int64_t>(dev_resources, 1024);
 
+    // allocate fixed query vectors
+    int dim = jpq_data.dim();
+    std::vector<float> host_zeros(dim, 0.0f);
+    std::vector<float> host_ones(dim, 1.0f);
+
+    // Create device vectors for queries
+    auto d_zeros = raft::make_device_vector<float, int64_t>(dev_resources, dim);
+    auto d_ones = raft::make_device_vector<float, int64_t>(dev_resources, dim);
+    raft::copy(d_zeros.data_handle(), host_zeros.data(), dim, dev_resources.get_stream());
+    raft::copy(d_ones.data_handle(), host_ones.data(), dim, dev_resources.get_stream());
+
+    // compare zeros with the first 10 vectors in the dataset
+    constexpr int64_t n_nodes = 10;
+    compute_l2_similarities(dev_resources, d_zeros, jpq_data, node_ids.data(), similarities.data(), n_nodes);
+    for (int i = 0; i < n_nodes; ++i) {
+        std::cout << "Similarity with zero: " << similarities[i] << std::endl;
+    }
+
+    // compare ones with the first 10 vectors in the dataset
+    compute_l2_similarities(dev_resources, d_ones, jpq_data, node_ids.data(), similarities.data(), n_nodes);
+    for (int i = 0; i < n_nodes; ++i) {
+        std::cout << "Similarity with ones: " << similarities[i] << std::endl;
+    }
+
+    // Benchmark random queries
     std::random_device rd;
     std::mt19937 gen(rd());
     // Query vector elements from -1 .. 1
