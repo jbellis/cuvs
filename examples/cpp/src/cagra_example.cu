@@ -172,18 +172,18 @@ __global__ void reduce_and_compute_similarities_kernel(
 }
 
 void compute_l2_similarities(
-        raft::device_resources const& dev_resources,
+        raft::device_resources const& res,
         const raft::device_vector<float, int64_t>& d_query,
         const jpq_dataset<float, int64_t>& jpq_data,
         const int32_t* host_node_ids,
         float* host_similarities,
         int64_t n_nodes)
 {
-    cudaStream_t stream = dev_resources.get_stream();
+    cudaStream_t stream = res.get_stream();
 
     // copy node ids to device
     int64_t dim = jpq_data.dim();
-    auto d_node_ids = raft::make_device_vector<int32_t, int64_t>(dev_resources, n_nodes);
+    auto d_node_ids = raft::make_device_vector<int32_t, int64_t>(res, n_nodes);
     raft::copy(d_node_ids.data_handle(), host_node_ids, n_nodes, stream);
 
     // First kernel: Compute partial distances for each block of threads
@@ -191,7 +191,7 @@ void compute_l2_similarities(
     int block_size = 256;
     int blocks_per_node = (dim + block_size - 1) / block_size;
     dim3 grid_size(blocks_per_node, n_nodes);
-    auto d_partial_distances = raft::make_device_vector<float, int64_t>(dev_resources, blocks_per_node * n_nodes);
+    auto d_partial_distances = raft::make_device_vector<float, int64_t>(res, blocks_per_node * n_nodes);
     compute_l2_partial_distances_kernel<<<grid_size, block_size, 0, stream>>>(
             d_query.data_handle(),
             jpq_data.vq_center.data_handle(),
@@ -206,7 +206,7 @@ void compute_l2_similarities(
     );
 
     // Second kernel: Reduce partial distances and compute similarities
-    auto d_similarities = raft::make_device_vector<float, int64_t>(dev_resources, n_nodes);
+    auto d_similarities = raft::make_device_vector<float, int64_t>(res, n_nodes);
     int reduce_blocks = (n_nodes + block_size - 1) / block_size;
     reduce_and_compute_similarities_kernel<<<reduce_blocks, block_size, 0, stream>>>(
             d_partial_distances.data_handle(),
@@ -373,8 +373,8 @@ jpq_dataset<MathT, IdxT> load_pq_vectors(raft::device_resources const &res, cons
     return jpq_data;
 }
 
-void jpq_test_simple(raft::device_resources const &dev_resources) {
-    auto jpq_data = load_pq_vectors<float, int64_t>(dev_resources, "test.pqv");
+void jpq_test_simple(raft::device_resources const &res) {
+    auto jpq_data = load_pq_vectors<float, int64_t>(res, "test.pqv");
 
     // allocate fixed query vectors
     int dim = jpq_data.dim();
@@ -382,10 +382,10 @@ void jpq_test_simple(raft::device_resources const &dev_resources) {
     std::vector<float> host_ones(dim, 1.0f);
 
     // Create device vectors for queries
-    auto d_zeros = raft::make_device_vector<float, int64_t>(dev_resources, dim);
-    auto d_ones = raft::make_device_vector<float, int64_t>(dev_resources, dim);
-    raft::copy(d_zeros.data_handle(), host_zeros.data(), dim, dev_resources.get_stream());
-    raft::copy(d_ones.data_handle(), host_ones.data(), dim, dev_resources.get_stream());
+    auto d_zeros = raft::make_device_vector<float, int64_t>(res, dim);
+    auto d_ones = raft::make_device_vector<float, int64_t>(res, dim);
+    raft::copy(d_zeros.data_handle(), host_zeros.data(), dim, res.get_stream());
+    raft::copy(d_ones.data_handle(), host_ones.data(), dim, res.get_stream());
 
     // allocate node IDs and similarities
     constexpr int64_t n_nodes = 10;
@@ -394,24 +394,24 @@ void jpq_test_simple(raft::device_resources const &dev_resources) {
     std::vector<float> similarities(n_nodes);
 
     // compare zeros with the first 10 vectors in the dataset
-    compute_l2_similarities(dev_resources, d_zeros, jpq_data, node_ids.data(), similarities.data(), n_nodes);
+    compute_l2_similarities(res, d_zeros, jpq_data, node_ids.data(), similarities.data(), n_nodes);
     for (int i = 0; i < n_nodes; ++i) {
         std::cout << "Similarity with zero: " << similarities[i] << std::endl;
     }
 
     // compare ones with the first 10 vectors in the dataset
-    compute_l2_similarities(dev_resources, d_ones, jpq_data, node_ids.data(), similarities.data(), n_nodes);
+    compute_l2_similarities(res, d_ones, jpq_data, node_ids.data(), similarities.data(), n_nodes);
     for (int i = 0; i < n_nodes; ++i) {
         std::cout << "Similarity with ones: " << similarities[i] << std::endl;
     }
 }
 
-void jpq_test_cohere(raft::device_resources const &dev_resources) {
-    auto jpq_data = load_pq_vectors<float, int64_t>(dev_resources, "cohere.pqv");
+void jpq_test_cohere(raft::device_resources const &res) {
+    auto jpq_data = load_pq_vectors<float, int64_t>(res, "cohere.pqv");
     std::array<int32_t, 32> node_ids{};
     std::array<float, 32> similarities{};
     std::array<float, 1024> host_q;
-    auto d_q = raft::make_device_vector<float, int64_t>(dev_resources, 1024);
+    auto d_q = raft::make_device_vector<float, int64_t>(res, 1024);
 
     // allocate fixed query vectors
     int dim = jpq_data.dim();
@@ -419,21 +419,21 @@ void jpq_test_cohere(raft::device_resources const &dev_resources) {
     std::vector<float> host_ones(dim, 1.0f);
 
     // Create device vectors for queries
-    auto d_zeros = raft::make_device_vector<float, int64_t>(dev_resources, dim);
-    auto d_ones = raft::make_device_vector<float, int64_t>(dev_resources, dim);
-    raft::copy(d_zeros.data_handle(), host_zeros.data(), dim, dev_resources.get_stream());
-    raft::copy(d_ones.data_handle(), host_ones.data(), dim, dev_resources.get_stream());
+    auto d_zeros = raft::make_device_vector<float, int64_t>(res, dim);
+    auto d_ones = raft::make_device_vector<float, int64_t>(res, dim);
+    raft::copy(d_zeros.data_handle(), host_zeros.data(), dim, res.get_stream());
+    raft::copy(d_ones.data_handle(), host_ones.data(), dim, res.get_stream());
 
     // compare zeros with the first 10 vectors in the dataset
     std::iota(node_ids.begin(), node_ids.end(), 0);
     constexpr int64_t n_nodes = 10;
-    compute_l2_similarities(dev_resources, d_zeros, jpq_data, node_ids.data(), similarities.data(), n_nodes);
+    compute_l2_similarities(res, d_zeros, jpq_data, node_ids.data(), similarities.data(), n_nodes);
     for (int i = 0; i < n_nodes; ++i) {
         std::cout << "Similarity with zero: " << similarities[i] << std::endl;
     }
 
     // compare ones with the first 10 vectors in the dataset
-    compute_l2_similarities(dev_resources, d_ones, jpq_data, node_ids.data(), similarities.data(), n_nodes);
+    compute_l2_similarities(res, d_ones, jpq_data, node_ids.data(), similarities.data(), n_nodes);
     for (int i = 0; i < n_nodes; ++i) {
         std::cout << "Similarity with ones: " << similarities[i] << std::endl;
     }
@@ -450,14 +450,14 @@ void jpq_test_cohere(raft::device_resources const &dev_resources) {
     for (int i = 0; i < 1000; ++i) {
         // query vector
         std::generate(host_q.begin(), host_q.end(), [&]() { return dis(gen); });
-        raft::copy(d_q.data_handle(), host_q.data(), 1024, dev_resources.get_stream());
+        raft::copy(d_q.data_handle(), host_q.data(), 1024, res.get_stream());
 
         auto start = std::chrono::high_resolution_clock::now();
         for (int j = 0; j < 50; ++j) {
             // node IDs
             std::generate(node_ids.begin(), node_ids.end(), [&]() { return node_dis(gen); });
             // compute similarities
-            compute_l2_similarities(dev_resources, d_q, jpq_data, node_ids.data(), similarities.data(), node_ids.size());
+            compute_l2_similarities(res, d_q, jpq_data, node_ids.data(), similarities.data(), node_ids.size());
         }
         elapsed += std::chrono::high_resolution_clock::now() - start;
     }
@@ -467,7 +467,7 @@ void jpq_test_cohere(raft::device_resources const &dev_resources) {
 
 int main()
 {
-  raft::device_resources dev_resources;
+  raft::device_resources res;
 
   // Set pool memory resource with 1 GiB initial pool size. All allocations use the same pool.
   rmm::mr::pool_memory_resource<rmm::mr::device_memory_resource> pool_mr(
@@ -478,8 +478,8 @@ int main()
   // algorithms). In that case only the internal arrays would use the pool, any other allocation
   // uses the default RMM memory resource. Here is how to change the workspace memory resource to
   // a pool with 2 GiB upper limit.
-  // raft::resource::set_workspace_to_pool_resource(dev_resources, 2 * 1024 * 1024 * 1024ull);
+  // raft::resource::set_workspace_to_pool_resource(res, 2 * 1024 * 1024 * 1024ull);
 
-  jpq_test_simple(dev_resources);
-  jpq_test_cohere(dev_resources);
+  jpq_test_simple(res);
+  jpq_test_cohere(res);
 }
