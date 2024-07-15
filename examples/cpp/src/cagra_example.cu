@@ -113,16 +113,25 @@ __global__ void compute_l2_partial_distances_kernel(
     if (node_idx >= n_nodes || tid >= dim) return;
 
     __shared__ float shared_distance[256]; // block size
+    __shared__ uint8_t shared_pq_codes[256]; // only 256/pq_len will be used
 
     const uint8_t* pq_codes = codepoints + node_ids[node_idx] * pq_dim;
 
-    // corresponding value at the pq center
-    int pq_idx = tid / pq_len; // which codebook center
-    int subvec_idx = tid % pq_len; // offset within the codebook center
-    uint8_t pq_code = pq_codes[pq_idx];
+    // Load pq_codes into shared memory
+    if (threadIdx.x % pq_len == 0) {
+        int shared_idx = threadIdx.x / pq_len;
+        if (shared_idx < 256 / pq_len) {
+            shared_pq_codes[shared_idx] = pq_codes[blockIdx.x * (256 / pq_len) + shared_idx];
+        }
+    }
+    __syncthreads();
+
+    // find the corresponding value in the pq center
+    int subvec_idx = tid % pq_len;
+    uint8_t pq_code = shared_pq_codes[threadIdx.x / pq_len];
     float pq_val = pq_codebook[pq_code * pq_len + subvec_idx];
 
-    // combine pq, vq, and query values to compute the distance
+    // Combine pq, vq, and query values to compute the distance
     float query_val = query[tid];
     float vq_val = vq_center[tid];
     float diff = query_val - (vq_val + pq_val);
@@ -131,6 +140,7 @@ __global__ void compute_l2_partial_distances_kernel(
     shared_distance[threadIdx.x] = local_distance;
     __syncthreads();
 
+    // Reduction within the block
     for (int s = blockDim.x / 2; s > 0; s >>= 1) {
         if (threadIdx.x < s) {
             shared_distance[threadIdx.x] += shared_distance[threadIdx.x + s];
