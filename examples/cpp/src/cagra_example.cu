@@ -100,7 +100,7 @@ struct jpq_dataset : cuvs::neighbors::dataset<IdxT> {
     }
 };
 
-__global__ void compute_l2_partial_distances_kernel(
+__global__ void compute_dp_partial_distances_kernel(
         const float* query,
         const float* vq_center,
         const float* pq_codebook,
@@ -134,8 +134,7 @@ __global__ void compute_l2_partial_distances_kernel(
     // combine pq, vq, and query values to compute the distance
     float query_val = query[index];
     float vq_val = vq_center[index];
-    float diff = query_val - (vq_val + pq_val);
-    float local_distance = diff * diff;
+    float local_distance = query_val * (vq_val + pq_val);
 
     shared_distance[threadIdx.x] = local_distance;
     __syncthreads();
@@ -154,7 +153,7 @@ __global__ void compute_l2_partial_distances_kernel(
     }
 }
 
-__global__ void reduce_and_compute_similarities_kernel(
+__global__ void reduce_and_compute_dp_similarities_kernel(
         const float* partial_distances,
         float* similarities,
         int n_nodes,
@@ -168,10 +167,10 @@ __global__ void reduce_and_compute_similarities_kernel(
         total_distance += partial_distances[node_idx * blocks_per_node + i];
     }
 
-    similarities[node_idx] = 1 / (1 + total_distance);
+    similarities[node_idx] = (1 + total_distance) / 2;
 }
 
-void compute_l2_similarities(
+void compute_dp_similarities(
         raft::device_resources const& res,
         const raft::device_vector<float, int64_t>& d_query,
         const jpq_dataset<float, int64_t>& jpq_data,
@@ -193,7 +192,7 @@ void compute_l2_similarities(
     int blocks_per_node = (dim + block_size - 1) / block_size;
     dim3 grid_size(blocks_per_node, n_nodes);
     auto d_partial_distances = raft::make_device_vector<float, int64_t>(res, blocks_per_node * n_nodes);
-    compute_l2_partial_distances_kernel<<<grid_size, block_size, 0, stream>>>(
+    compute_dp_partial_distances_kernel<<<grid_size, block_size, 0, stream>>>(
             d_query.data_handle(),
             jpq_data.vq_center.data_handle(),
             jpq_data.pq_codebook.data_handle(),
@@ -209,7 +208,7 @@ void compute_l2_similarities(
     // Second kernel: Reduce partial distances and compute similarities
     auto d_similarities = raft::make_device_vector<float, int64_t>(res, n_nodes);
     int reduce_blocks = (n_nodes + block_size - 1) / block_size;
-    reduce_and_compute_similarities_kernel<<<reduce_blocks, block_size, 0, stream>>>(
+    reduce_and_compute_dp_similarities_kernel<<<reduce_blocks, block_size, 0, stream>>>(
             d_partial_distances.data_handle(),
             d_similarities.data_handle(),
             n_nodes,
@@ -396,13 +395,13 @@ void jpq_test_simple(raft::device_resources const &res) {
     std::vector<float> similarities(n_nodes);
 
     // compare zeros with the first 10 vectors in the dataset
-    compute_l2_similarities(res, d_zeros, jpq_data, node_ids.data(), similarities.data(), n_nodes);
+    compute_dp_similarities(res, d_zeros, jpq_data, node_ids.data(), similarities.data(), n_nodes);
     for (int i = 0; i < n_nodes; ++i) {
         std::cout << "Similarity with zero: " << similarities[i] << std::endl;
     }
 
     // compare ones with the first 10 vectors in the dataset
-    compute_l2_similarities(res, d_ones, jpq_data, node_ids.data(), similarities.data(), n_nodes);
+    compute_dp_similarities(res, d_ones, jpq_data, node_ids.data(), similarities.data(), n_nodes);
     for (int i = 0; i < n_nodes; ++i) {
         std::cout << "Similarity with ones: " << similarities[i] << std::endl;
     }
@@ -430,13 +429,13 @@ void jpq_test_cohere(raft::device_resources const &res) {
     // compare zeros with the first 10 vectors in the dataset
     std::iota(node_ids.begin(), node_ids.end(), 0);
     constexpr int64_t n_nodes = 10;
-    compute_l2_similarities(res, d_zeros, jpq_data, node_ids.data(), similarities.data(), n_nodes);
+    compute_dp_similarities(res, d_zeros, jpq_data, node_ids.data(), similarities.data(), n_nodes);
     for (int i = 0; i < n_nodes; ++i) {
         std::cout << "Similarity with zero: " << similarities[i] << std::endl;
     }
 
     // compare ones with the first 10 vectors in the dataset
-    compute_l2_similarities(res, d_ones, jpq_data, node_ids.data(), similarities.data(), n_nodes);
+    compute_dp_similarities(res, d_ones, jpq_data, node_ids.data(), similarities.data(), n_nodes);
     for (int i = 0; i < n_nodes; ++i) {
         std::cout << "Similarity with ones: " << similarities[i] << std::endl;
     }
@@ -461,7 +460,7 @@ void jpq_test_cohere(raft::device_resources const &res) {
             // node IDs
             std::generate(node_ids.begin(), node_ids.end(), [&]() { return node_dis(gen); });
             // compute similarities
-            compute_l2_similarities(res, d_q, jpq_data, node_ids.data(), similarities.data(), node_ids.size());
+            compute_dp_similarities(res, d_q, jpq_data, node_ids.data(), similarities.data(), node_ids.size());
         }
         elapsed += std::chrono::high_resolution_clock::now() - start;
     }
