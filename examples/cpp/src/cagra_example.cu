@@ -196,7 +196,7 @@ void compute_l2_similarities(
     compute_l2_partial_distances_kernel<<<grid_size, block_size, 0, stream>>>(
             d_query.data_handle(),
             jpq_data.vq_center.data_handle(),
-            jpq_data.pq_codebook.data_handle() + 1,
+            jpq_data.pq_codebook.data_handle(),
             jpq_data.codepoints.data_handle(),
             d_node_ids.data_handle(),
             d_partial_distances.data_handle(),
