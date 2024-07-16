@@ -100,79 +100,110 @@ struct jpq_dataset : cuvs::neighbors::dataset<IdxT> {
     }
 };
 
-__global__ void compute_dp_partial_distances_kernel(
+__global__ void compute_adc_lut_kernel(
         const float* query,
         const float* vq_center,
         const float* pq_codebook,
-        const uint8_t* codepoints,
-        const int32_t* node_ids,
-        float* partial_distances,
-        int64_t pq_dim, // how many subspaces
-        int64_t pq_len, // how many dimensions per subspace centroid
-        int n_nodes,
+        float* adc_lut,
+        int64_t pq_dim,
+        int64_t pq_len,
         int dim
 ) {
-    int index = blockIdx.x * blockDim.x + threadIdx.x;
-    int node_idx = blockIdx.y;
+    int subspace_idx = blockIdx.x;
+    int centroid_idx = threadIdx.x;
 
-    __shared__ float shared_distance[256]; // block size
-    if (node_idx >= n_nodes || index >= dim) {
-        shared_distance[threadIdx.x] = 0.0f;
-        return;
+    if (subspace_idx >= pq_dim || centroid_idx >= 256) return;
+
+    float partial_distance = 0.0f;
+    for (int i = 0; i < pq_len; i++) {
+        int feature_idx = subspace_idx * pq_len + i;
+        if (feature_idx >= dim) break;
+
+        float q_val = query[feature_idx];
+        float vq_val = vq_center[feature_idx];
+        float pq_val = pq_codebook[subspace_idx * 256 * pq_len + centroid_idx * pq_len + i];
+
+        partial_distance += q_val * (vq_val + pq_val);
     }
 
-    // the PQ codes (indexes of the subspace centroids) for this node
+    adc_lut[subspace_idx * 256 + centroid_idx] = partial_distance;
+}
+
+float* compute_dp_setup(
+        raft::device_resources const& res,
+        const raft::device_vector<float, int64_t>& d_query,
+        const jpq_dataset<float, int64_t>& jpq_data)
+{
+    cudaStream_t stream = res.get_stream();
+    int64_t pq_dim = jpq_data.pq_dim();
+    int64_t pq_len = jpq_data.pq_len;
+    int64_t dim = jpq_data.dim();
+
+    // Allocate device memory for ADC lookup table
+    float* d_adc_lut;
+    RAFT_CUDA_TRY(cudaMalloc(&d_adc_lut, pq_dim * 256 * sizeof(float)));
+
+    // Launch kernel to compute ADC lookup table
+    dim3 block_size(256);
+    dim3 grid_size(pq_dim);
+    compute_adc_lut_kernel<<<grid_size, block_size, 0, stream>>>(
+            d_query.data_handle(),
+            jpq_data.vq_center.data_handle(),
+            jpq_data.pq_codebook.data_handle(),
+            d_adc_lut,
+            pq_dim,
+            pq_len,
+            dim
+    );
+
+    // Synchronize to ensure computation is complete
+    res.sync_stream();
+
+    return d_adc_lut;
+}
+
+__global__ void compute_dp_similarities_kernel(
+        const float* adc_lut,
+        const uint8_t* codepoints,
+        const int32_t* node_ids,
+        float* similarities,
+        int64_t pq_dim,
+        int n_nodes
+) {
+    __shared__ float shared_distance[256]; // assuming max pq_dim is 256
+
+    int subspace_idx = threadIdx.x;
+    if (subspace_idx >= pq_dim) {
+        shared_distance[subspace_idx] = 0.0f;
+        return;
+    }
+    int node_idx = blockIdx.x;
     const uint8_t* pq_codes = codepoints + node_ids[node_idx] * pq_dim;
-    int subspace_idx = index / pq_len; // which codebook subspace
-    const float* subspace_centroids = pq_codebook + subspace_idx * (pq_len * 256); // 256 = pq_n_centers
-
-    // find the value corresponding to `index` in the pq centroid
-    int subvec_idx = index % pq_len; // offset within the codebook center
     uint8_t pq_code = pq_codes[subspace_idx];
-    float pq_val = subspace_centroids[pq_code * pq_len + subvec_idx];
 
-    // combine pq, vq, and query values to compute the distance
-    float query_val = query[index];
-    float vq_val = vq_center[index];
-    float local_distance = query_val * (vq_val + pq_val);
+    float partial_distance = adc_lut[subspace_idx * 256 + pq_code];
 
-    shared_distance[threadIdx.x] = local_distance;
+    shared_distance[subspace_idx] = partial_distance;
     __syncthreads();
 
-    // reduce within block
+    // Reduce within block
     for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (threadIdx.x < s) {
-            shared_distance[threadIdx.x] += shared_distance[threadIdx.x + s];
+        if (subspace_idx < s) {
+            shared_distance[subspace_idx] += shared_distance[subspace_idx + s];
         }
         __syncthreads();
     }
 
-    // write this block's partial distance to global memory
-    if (threadIdx.x == 0) {
-        partial_distances[node_idx * gridDim.x + blockIdx.x] = shared_distance[0];
+    // Compute final similarity
+    if (subspace_idx == 0) {
+        float total_distance = shared_distance[0];
+        similarities[node_idx] = (1 + total_distance) / 2;
     }
-}
-
-__global__ void reduce_and_compute_dp_similarities_kernel(
-        const float* partial_distances,
-        float* similarities,
-        int n_nodes,
-        int blocks_per_node
-) {
-    int node_idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (node_idx >= n_nodes) return;
-
-    float total_distance = 0.0f;
-    for (int i = 0; i < blocks_per_node; i++) {
-        total_distance += partial_distances[node_idx * blocks_per_node + i];
-    }
-
-    similarities[node_idx] = (1 + total_distance) / 2;
 }
 
 void compute_dp_similarities(
         raft::device_resources const& res,
-        const raft::device_vector<float, int64_t>& d_query,
+        float* adc_lut,
         const jpq_dataset<float, int64_t>& jpq_data,
         const int32_t* host_node_ids,
         float* host_similarities,
@@ -180,39 +211,24 @@ void compute_dp_similarities(
 {
     cudaStream_t stream = res.get_stream();
 
-    // copy node ids to device
-    int64_t dim = jpq_data.dim();
+    // Copy node ids to device
     auto d_node_ids = raft::make_device_vector<int32_t, int64_t>(res, n_nodes);
     raft::copy(d_node_ids.data_handle(), host_node_ids, n_nodes, stream);
-    res.sync_stream();
 
-    // First kernel: Compute partial distances for each block of threads
-    // (we support vectors larger than 256 dimensions), for all nodes in a single grid
-    int block_size = 256;
-    int blocks_per_node = (dim + block_size - 1) / block_size;
-    dim3 grid_size(blocks_per_node, n_nodes);
-    auto d_partial_distances = raft::make_device_vector<float, int64_t>(res, blocks_per_node * n_nodes);
-    compute_dp_partial_distances_kernel<<<grid_size, block_size, 0, stream>>>(
-            d_query.data_handle(),
-            jpq_data.vq_center.data_handle(),
-            jpq_data.pq_codebook.data_handle(),
+    // Allocate device memory for similarities
+    auto d_similarities = raft::make_device_vector<float, int64_t>(res, n_nodes);
+
+    // Launch kernel to compute similarities
+    int64_t pq_dim = jpq_data.pq_dim();
+    dim3 block_size(pq_dim);
+    dim3 grid_size(n_nodes);
+    compute_dp_similarities_kernel<<<grid_size, block_size, 0, stream>>>(
+            adc_lut,
             jpq_data.codepoints.data_handle(),
             d_node_ids.data_handle(),
-            d_partial_distances.data_handle(),
-            jpq_data.pq_dim(),
-            jpq_data.pq_len,
-            n_nodes,
-            dim
-    );
-
-    // Second kernel: Reduce partial distances and compute similarities
-    auto d_similarities = raft::make_device_vector<float, int64_t>(res, n_nodes);
-    int reduce_blocks = (n_nodes + block_size - 1) / block_size;
-    reduce_and_compute_dp_similarities_kernel<<<reduce_blocks, block_size, 0, stream>>>(
-            d_partial_distances.data_handle(),
             d_similarities.data_handle(),
-            n_nodes,
-            blocks_per_node
+            pq_dim,
+            n_nodes
     );
 
     // Copy results back to host
@@ -373,40 +389,6 @@ jpq_dataset<MathT, IdxT> load_pq_vectors(raft::device_resources const &res, cons
     return jpq_data;
 }
 
-void jpq_test_simple(raft::device_resources const &res) {
-    auto jpq_data = load_pq_vectors<float, int64_t>(res, "test.pqv");
-
-    // allocate fixed query vectors
-    int dim = jpq_data.dim();
-    std::vector<float> host_zeros(dim, 0.0f);
-    std::vector<float> host_ones(dim, 1.0f);
-
-    // Create device vectors for queries
-    auto d_zeros = raft::make_device_vector<float, int64_t>(res, dim);
-    auto d_ones = raft::make_device_vector<float, int64_t>(res, dim);
-    raft::copy(d_zeros.data_handle(), host_zeros.data(), dim, res.get_stream());
-    raft::copy(d_ones.data_handle(), host_ones.data(), dim, res.get_stream());
-    res.sync_stream();
-
-    // allocate node IDs and similarities
-    constexpr int64_t n_nodes = 10;
-    std::vector<int32_t> node_ids(n_nodes);
-    std::iota(node_ids.begin(), node_ids.end(), 0);
-    std::vector<float> similarities(n_nodes);
-
-    // compare zeros with the first 10 vectors in the dataset
-    compute_dp_similarities(res, d_zeros, jpq_data, node_ids.data(), similarities.data(), n_nodes);
-    for (int i = 0; i < n_nodes; ++i) {
-        std::cout << "Similarity with zero: " << similarities[i] << std::endl;
-    }
-
-    // compare ones with the first 10 vectors in the dataset
-    compute_dp_similarities(res, d_ones, jpq_data, node_ids.data(), similarities.data(), n_nodes);
-    for (int i = 0; i < n_nodes; ++i) {
-        std::cout << "Similarity with ones: " << similarities[i] << std::endl;
-    }
-}
-
 void jpq_test_cohere(raft::device_resources const &res) {
     auto jpq_data = load_pq_vectors<float, int64_t>(res, "cohere.pqv");
     std::array<int32_t, 32> node_ids{};
@@ -429,16 +411,22 @@ void jpq_test_cohere(raft::device_resources const &res) {
     // compare zeros with the first 10 vectors in the dataset
     std::iota(node_ids.begin(), node_ids.end(), 0);
     constexpr int64_t n_nodes = 10;
-    compute_dp_similarities(res, d_zeros, jpq_data, node_ids.data(), similarities.data(), n_nodes);
+
+    // Compute ADC lookup table for zeros
+    float* adc_lut_zeros = compute_dp_setup(res, d_zeros, jpq_data);
+    compute_dp_similarities(res, adc_lut_zeros, jpq_data, node_ids.data(), similarities.data(), n_nodes);
     for (int i = 0; i < n_nodes; ++i) {
         std::cout << "Similarity with zero: " << similarities[i] << std::endl;
     }
+    RAFT_CUDA_TRY(cudaFree(adc_lut_zeros));
 
     // compare ones with the first 10 vectors in the dataset
-    compute_dp_similarities(res, d_ones, jpq_data, node_ids.data(), similarities.data(), n_nodes);
+    float* adc_lut_ones = compute_dp_setup(res, d_ones, jpq_data);
+    compute_dp_similarities(res, adc_lut_ones, jpq_data, node_ids.data(), similarities.data(), n_nodes);
     for (int i = 0; i < n_nodes; ++i) {
         std::cout << "Similarity with ones: " << similarities[i] << std::endl;
     }
+    RAFT_CUDA_TRY(cudaFree(adc_lut_ones));
 
     // Benchmark random queries
     std::random_device rd;
@@ -456,12 +444,19 @@ void jpq_test_cohere(raft::device_resources const &res) {
         res.sync_stream();
 
         auto start = std::chrono::high_resolution_clock::now();
+
+        // Compute ADC lookup table for the query
+        float* adc_lut = compute_dp_setup(res, d_q, jpq_data);
+
         for (int j = 0; j < 50; ++j) {
             // node IDs
             std::generate(node_ids.begin(), node_ids.end(), [&]() { return node_dis(gen); });
             // compute similarities
-            compute_dp_similarities(res, d_q, jpq_data, node_ids.data(), similarities.data(), node_ids.size());
+            compute_dp_similarities(res, adc_lut, jpq_data, node_ids.data(), similarities.data(), node_ids.size());
         }
+
+        RAFT_CUDA_TRY(cudaFree(adc_lut));
+
         elapsed += std::chrono::high_resolution_clock::now() - start;
     }
 
