@@ -127,7 +127,7 @@ __global__ void compute_adc_lut_kernel(
             partial_distance += q_val * (vq_val + pq_val);
         }
 
-        adc_lut[subspace_idx * 256 + centroid_idx] = partial_distance;
+        adc_lut[centroid_idx * pq_dim + subspace_idx] = partial_distance;
     }
 }
 
@@ -185,7 +185,7 @@ __global__ void compute_dp_similarities_kernel(
     // Each thread processes multiple subspaces if needed
     for (int subspace_idx = tid; subspace_idx < pq_dim; subspace_idx += threads_per_block) {
         uint8_t pq_code = pq_codes[subspace_idx];
-        thread_distance += adc_lut[subspace_idx * 256 + pq_code];
+        thread_distance += adc_lut[pq_code * pq_dim + subspace_idx];
     }
     shared_distance[tid] = thread_distance;
     __syncthreads();
