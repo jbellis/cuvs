@@ -171,37 +171,41 @@ __global__ void compute_dp_similarities_kernel(
         const int32_t* node_ids,
         float* similarities,
         int64_t pq_dim,
+        int64_t pq_len,
         int n_nodes
 ) {
-    int node_idx = blockIdx.x;
+    extern __shared__ float shared_memory[];
+    float* shared_codebook = shared_memory;
+    float* shared_similarities = shared_memory + 256;  // 256 float32s in the codebook
+
     int tid = threadIdx.x;
-    int threads_per_block = blockDim.x;
 
-    __shared__ float shared_distance[256];
-
-    float thread_distance = 0.0f;
-    const uint8_t* pq_codes = codepoints + node_ids[node_idx] * pq_dim;
-
-    // Each thread processes multiple subspaces if needed
-    for (int subspace_idx = tid; subspace_idx < pq_dim; subspace_idx += threads_per_block) {
-        uint8_t pq_code = pq_codes[subspace_idx];
-        thread_distance += adc_lut[pq_code * pq_dim + subspace_idx];
+    // Initialize shared similarities
+    for (int i = tid; i < n_nodes; i += blockDim.x) {
+        shared_similarities[i] = 0.0f;
     }
-    shared_distance[tid] = thread_distance;
     __syncthreads();
 
-    // Reduce within block
-    for (int s = threads_per_block / 2; s > 0; s >>= 1) {
-        if (tid < s) {
-            shared_distance[tid] += shared_distance[tid + s];
+    for (int subspace_idx = 0; subspace_idx < pq_dim; subspace_idx++) {
+        // Load codebook for this subspace into shared memory
+        for (int i = tid; i < 256; i += blockDim.x) {
+            shared_codebook[i] = adc_lut[i * pq_dim + subspace_idx];
         }
         __syncthreads();
+
+        // Process this subspace for all nodes
+        for (int node_idx = tid; node_idx < n_nodes; node_idx += blockDim.x) {
+            int32_t node_id = node_ids[node_idx];
+            const uint8_t* pq_codes = codepoints + node_id * pq_dim;
+            uint8_t pq_code = pq_codes[subspace_idx];
+            shared_similarities[node_idx] += shared_codebook[pq_code];
+        }
+        __syncthreads(); // don't let anyone start overwriting the codebook until everyone is done
     }
 
-    // Compute final similarity
-    if (tid == 0) {
-        float total_distance = shared_distance[0];
-        similarities[node_idx] = (1 + total_distance) / 2;
+    // Copy shared_similarities to global memory
+    for (int node_idx = tid; node_idx < n_nodes; node_idx += blockDim.x) {
+        similarities[node_idx] = (1 + shared_similarities[node_idx]) / 2;
     }
 }
 
@@ -223,16 +227,17 @@ void compute_dp_similarities(
     auto d_similarities = raft::make_device_vector<float, int64_t>(res, n_nodes);
 
     // Launch kernel to compute similarities
-    int64_t pq_dim = jpq_data.pq_dim();
-    int block_size = std::min(256, static_cast<int>(pq_dim));
-    dim3 block_dim(block_size);
-    dim3 grid_size(n_nodes);
-    compute_dp_similarities_kernel<<<grid_size, block_size, 0, stream>>>(
+    // TODO this may be a bad fit for the search path, where we only have 32 nodes at once
+    int block_size = 128;  // max threads in a contemporary SM
+    int grid_size = 1;  // Single block
+    size_t shared_mem_size = (256 + n_nodes) * sizeof(float);
+    compute_dp_similarities_kernel<<<grid_size, block_size, shared_mem_size, stream>>>(
             adc_lut,
             jpq_data.codepoints.data_handle(),
             d_node_ids.data_handle(),
             d_similarities.data_handle(),
-            pq_dim,
+            jpq_data.pq_dim(),
+            jpq_data.pq_len,
             n_nodes
     );
 
