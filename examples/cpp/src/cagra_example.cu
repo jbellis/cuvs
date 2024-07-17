@@ -396,8 +396,9 @@ jpq_dataset<MathT, IdxT> load_pq_vectors(raft::device_resources const &res, cons
 
 void jpq_test_cohere(raft::device_resources const &res) {
     auto jpq_data = load_pq_vectors<float, int64_t>(res, "cohere.pqv");
-    std::array<int32_t, 200> node_ids{};
-    std::array<float, 32> similarities{};
+    const int max_nodes = 200;
+    std::array<int32_t, max_nodes> node_ids{};
+    std::array<float, max_nodes> similarities{};
     std::array<float, 1024> host_q;
     auto d_q = raft::make_device_vector<float, int64_t>(res, 1024);
 
